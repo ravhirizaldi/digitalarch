@@ -1,0 +1,47 @@
+{
+  "name": "digitalarch",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:up": "docker compose up -d --pull never",
+    "db:down": "docker compose down",
+    "db:status": "node scripts/db.mjs status",
+    "db:migrate": "node scripts/db.mjs migrate",
+    "db:reconcile": "node scripts/reconcile.mjs",
+    "admin:bootstrap": "node scripts/bootstrap.mjs",
+    "dev": "node --watch scripts/dev.mjs",
+    "build": "vite build",
+    "lint": "eslint src server scripts test server.mjs bridge.mjs",
+    "format:check": "prettier --check src server scripts test/*.mjs server.mjs bridge.mjs eslint.config.mjs package.json compose.yaml README.md PRODUCT.md DESIGN.md DATABASE.md ENGINEERING_REPORT.md OCR.md",
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:profiles": "dotnet run --project test/ProfileChecks/ProfileChecks.csproj",
+    "test:ocr-runtime": "node --test test/ocr-runtime.check.mjs",
+    "ocr:benchmark": "node scripts/ocr-benchmark.mjs",
+    "ocr:paddle:setup": "python3 scripts/paddle/setup.py",
+    "test:paddle-runtime": "node --test test/ocr-paddle-runtime.check.mjs",
+    "test:hardware": "node scripts/verify-hardware.mjs",
+    "test:browser": "node test/browser.mjs",
+    "fixtures": "node scripts/generate-fixtures.mjs"
+  },
+  "dependencies": {
+    "@ant-design/icons": "6.3.4",
+    "@node-rs/argon2": "^2.2.2",
+    "antd": "6.7.0",
+    "pg": "^8.23.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.14.0",
+    "playwright": "1.65.0",
+    "prettier": "^3.10.1",
+    "vite": "^7.2.0"
+  },
+  "packageManager": "pnpm@10.30.3"
+}

@@ -1,0 +1,45 @@
+import { theme } from 'antd';
+
+export const enterpriseTheme = {
+  algorithm: (seed, map) => ({
+    ...theme.compactAlgorithm(seed, map),
+    fontSize: 13,
+    fontSizeSM: 12,
+    controlHeight: 28,
+    controlHeightSM: 28,
+  }),
+  token: {
+    colorPrimary: '#2463a6',
+    colorInfo: '#2463a6',
+    colorBgLayout: '#f3f5f8',
+    colorBgContainer: '#ffffff',
+    colorBorder: '#d8dee7',
+    colorText: '#202c3b',
+    colorTextSecondary: '#566376',
+    colorTextTertiary: '#667386',
+    borderRadius: 4,
+    fontSize: 13,
+    fontSizeSM: 12,
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    controlHeight: 30,
+    controlHeightSM: 28,
+    motion: false,
+  },
+  components: {
+    Button: {
+      primaryShadow: 'none',
+      defaultShadow: 'none',
+      fontWeight: 400,
+      contentFontSizeSM: 13,
+    },
+    Badge: { colorText: '#e8eef6' },
+    Layout: { headerBg: '#182d46', headerHeight: 44, headerPadding: '0 12px' },
+    Menu: { itemHeight: 32, horizontalLineHeight: '34px', itemMarginInline: 4 },
+    Table: { cellPaddingBlockSM: 6, cellPaddingInlineSM: 8, headerBg: '#f3f5f8' },
+    Descriptions: { itemPaddingBottom: 8 },
+    Tabs: { horizontalMargin: '0 0 8px 0', horizontalItemGutter: 20 },
+    Drawer: { footerPaddingBlock: 8, footerPaddingInline: 12 },
+    Modal: { paddingContentHorizontalLG: 16 },
+    Splitter: { splitBarSize: 6, splitTriggerSize: 2 },
+  },
+};

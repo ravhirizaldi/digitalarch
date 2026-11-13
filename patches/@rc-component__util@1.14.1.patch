@@ -1,0 +1,34 @@
+diff --git a/es/Dom/dynamicCSS.js b/es/Dom/dynamicCSS.js
+index ad1ea3439f501c96543e3f5b0c89687502a4d87a..b33c79586edfecfabe523c05f75fad5fa68c7c50 100644
+--- a/es/Dom/dynamicCSS.js
++++ b/es/Dom/dynamicCSS.js
+@@ -51,8 +51,10 @@ export function injectCSS(css, option = {}) {
+   if (isPrependQueue && priority) {
+     styleNode.setAttribute(APPEND_PRIORITY, `${priority}`);
+   }
+-  if (csp?.nonce) {
+-    styleNode.nonce = csp?.nonce;
++  // Preserve the app nonce for internal scrollbar helpers that omit csp.
++  const nonce = csp?.nonce || document.querySelector('meta[name="csp-nonce"]')?.content;
++  if (nonce) {
++    styleNode.nonce = nonce;
+   }
+   styleNode.innerHTML = css;
+   const container = getContainer(option);
+diff --git a/lib/Dom/dynamicCSS.js b/lib/Dom/dynamicCSS.js
+index 3bb3e957ae4a6721301cdae42125150eaa172ccf..ef517fc3a0b027fb60476e4bf3f5709c25888a2c 100644
+--- a/lib/Dom/dynamicCSS.js
++++ b/lib/Dom/dynamicCSS.js
+@@ -61,8 +61,10 @@ function injectCSS(css, option = {}) {
+   if (isPrependQueue && priority) {
+     styleNode.setAttribute(APPEND_PRIORITY, `${priority}`);
+   }
+-  if (csp?.nonce) {
+-    styleNode.nonce = csp?.nonce;
++  // Preserve the app nonce for internal scrollbar helpers that omit csp.
++  const nonce = csp?.nonce || document.querySelector('meta[name="csp-nonce"]')?.content;
++  if (nonce) {
++    styleNode.nonce = nonce;
+   }
+   styleNode.innerHTML = css;
+   const container = getContainer(option);

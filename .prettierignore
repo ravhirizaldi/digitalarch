@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.local/
+.impeccable/
+pnpm-lock.yaml
+DigitalArch.Service/
+DigitalArch.Ocr/
+test/ProfileChecks/

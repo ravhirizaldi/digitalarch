@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: ${PGVECTOR_IMAGE:?Set an existing local pgvector image}
+    pull_policy: never
+    container_name: digitalarch-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - '127.0.0.1:${POSTGRES_HOST_PORT}:5432'
+    volumes:
+      - digitalarch_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  digitalarch_pgdata:
+    name: digitalarch_pgdata
