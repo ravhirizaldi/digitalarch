@@ -1,6 +1,6 @@
 # Entity relationship diagrams
 
-**As-built baseline: 2026-11-14, migrations 001–011.** These diagrams describe the local source schema, not a fresh inspection of a running database. Selected columns are shown; the SQL migrations remain authoritative. Approval decisions and the final archive viewer do not exist yet; their proposed model is in [APPROVAL.md](APPROVAL.md).
+**As-built baseline: 2026-11-15, migrations 001–014.** These diagrams describe the local source schema, not a fresh inspection of a running database. Selected columns are shown; the SQL migrations remain authoritative. Approval decisions and the final archive viewer do not exist yet; their proposed model is in [APPROVAL.md](APPROVAL.md).
 
 ## 1. Accounts, roles and sessions
 
@@ -125,6 +125,7 @@ erDiagram
         UUID scan_session_id FK
         INTEGER capture_order
         INTEGER display_order
+        TEXT page_label
         TEXT original_storage_key UK
         TEXT active_storage_key
         TEXT sha256
@@ -164,6 +165,7 @@ Important constraints not fully expressed by the drawing:
 - `pages.replaced_by_page_id` is a self-FK to the retained replacement candidate. Revision `metadata` records candidate/session provenance as JSON, not additional FK columns.
 - `audit_logs.entity_id` is a polymorphic identifier, **not** a foreign key to every possible entity table. Actor and batch can be NULL for system/global events.
 - Original provenance is protected by a trigger. Soft deletion excludes a batch from normal access without deleting children or files. `page_revisions` does not imply that every rotation is a new image file.
+- `pages.page_label` is an optional trimmed 1–120-character name. `document_pages` is a read-only view, not another entity table: it projects pages plus their contiguous included-document `page_number`. Removed/replacement candidates have NULL numbers; numbering ignores UI/session filters. A NULL custom label displays the automatic Page 1–N name, leaving capture order and filenames immutable.
 
 ## 3. OCR, metadata and QC
 
@@ -242,6 +244,8 @@ erDiagram
         UUID id PK
         UUID document_id FK
         INTEGER cycle
+        UUID submitted_by FK
+        TIMESTAMPTZ submitted_at
         UUID claimed_by FK
         TIMESTAMPTZ claim_expires_at
         BOOLEAN ordering_reviewed

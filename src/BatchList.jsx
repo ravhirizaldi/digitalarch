@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
+  Badge,
   Button,
   Collapse,
   Empty,
@@ -11,43 +12,70 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
 } from 'antd';
 import {
   CalendarOutlined,
+  CheckCircleOutlined,
   ClearOutlined,
   ClockCircleOutlined,
+  DeleteOutlined,
+  ExclamationCircleOutlined,
+  EyeOutlined,
   FileImageOutlined,
   FileTextOutlined,
   FolderOpenOutlined,
+  HistoryOutlined,
   EnvironmentOutlined,
   PlusOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  QuestionCircleOutlined,
+  RollbackOutlined,
   ScanOutlined,
   SearchOutlined,
+  SendOutlined,
   TagsOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { api } from './api';
 import { dateTime, IconButton } from './ui';
-import WorklistTable, { BatchIdentity, ColumnHeading } from './WorklistTable';
+import WorklistTable, { BatchIdentity, BatchIdHeading, ColumnHeading } from './WorklistTable';
 import { queryChoice, queryPage, useUrlState } from './useUrlState';
 
 function readBatchState(params) {
   const size = Number(queryChoice(params, 'size', ['25', '50', '100']));
+  const returned = params.get('status') === 'rework';
+  const workflowView = ['capture_completed', 'submitted', 'completed'].includes(
+    params.get('status'),
+  );
   return {
-    status: queryChoice(params, 'status', ['in_progress', 'paused', 'capture_completed']),
+    status: queryChoice(params, 'status', [
+      'in_progress',
+      'paused',
+      'capture_completed',
+      'rework',
+      'submitted',
+      'completed',
+    ]),
     q: (params.get('q') || '').slice(0, 240),
     page: Math.min(queryPage(params, 'page'), Math.floor(1_000_000 / size) + 1),
     size,
-    sort: queryChoice(params, 'sort', [
-      'updated_at',
-      'created_at',
-      'batch_code',
-      'physical_location',
-      'page_count',
-      'session_count',
-      'status',
-      'assigned_operator',
-    ]),
+    sort: queryChoice(
+      params,
+      'sort',
+      [
+        'batch_code',
+        'physical_location',
+        'page_count',
+        'session_count',
+        'assigned_operator',
+        ...(returned
+          ? ['returned_at']
+          : ['updated_at', 'created_at', workflowView ? 'workflow_status' : 'status']),
+      ],
+      returned ? 'returned_at' : 'updated_at',
+    ),
     direction: queryChoice(params, 'direction', ['desc', 'asc']),
     activity: params.get('activity') === '1',
   };
@@ -70,6 +98,10 @@ const activityLabels = {
   'page.rotated': 'Page rotated',
   'page.removed': 'Page removed',
   'page.restored': 'Page restored',
+  'page.renamed': 'Page label updated',
+  'qc.returned': 'Returned from QC',
+  'qc.submitted': 'Sent to QC',
+  'qc.resubmitted': 'Resubmitted to QC',
 };
 
 export const batchStatus = (value) => (
@@ -81,6 +113,17 @@ export const batchStatus = (value) => (
     {value.replaceAll('_', ' ')}
   </Tag>
 );
+
+const workflowLabels = {
+  capturing: 'Capturing',
+  operator_preparation: 'Not sent to QC',
+  preparing: 'Preparing OCR',
+  qc_waiting: 'Waiting for QC',
+  rework: 'Returned from QC',
+  awaiting_approval_l1: 'Awaiting L1',
+  awaiting_approval_l2: 'Awaiting L2',
+  approved: 'Final approved',
+};
 
 export default function BatchList({
   home,
@@ -96,10 +139,13 @@ export default function BatchList({
     total: 0,
     pages: 0,
     sessions: 0,
+    returned: 0,
     activity: [],
   });
   const [query, setQuery] = useUrlState(readBatchState);
   const { status, q: search, page, size: pageSize, sort, direction, activity } = query;
+  const tracking = ['submitted', 'completed'].includes(status);
+  const workflowView = ['capture_completed', 'submitted', 'completed'].includes(status);
   const requestId = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -175,10 +221,11 @@ export default function BatchList({
   const columns = [
     {
       ...sortable('batch_code'),
-      title: heading(<FileTextOutlined aria-hidden />, 'Batch'),
+      title: <BatchIdHeading />,
       dataIndex: 'batch_code',
-      width: 270,
-      render: (value) => <BatchIdentity value={value}>{value}</BatchIdentity>,
+      width: 64,
+      align: 'center',
+      render: (value) => <BatchIdentity value={value} />,
     },
     {
       ...sortable('physical_location'),
@@ -188,6 +235,34 @@ export default function BatchList({
       ellipsis: true,
       render: (value) => value || '—',
     },
+    ...(status === 'rework'
+      ? [
+          {
+            key: 'qc_return_reason',
+            title: (
+              <Tooltip title="QC return reason">
+                <QuestionCircleOutlined aria-label="QC return reason" />
+              </Tooltip>
+            ),
+            dataIndex: 'qc_return_reason',
+            width: 44,
+            align: 'center',
+            render: (value) => (
+              <Tooltip
+                title={value || 'Review QC findings'}
+                trigger={['hover', 'focus']}
+                styles={{ body: { maxHeight: '50vh', overflowY: 'auto', whiteSpace: 'pre-wrap' } }}
+              >
+                <Button
+                  type="text"
+                  icon={<QuestionCircleOutlined aria-hidden />}
+                  aria-label="QC return reason"
+                />
+              </Tooltip>
+            ),
+          },
+        ]
+      : []),
     {
       ...sortable('page_count'),
       title: heading(<FileImageOutlined aria-hidden />, 'Pages'),
@@ -202,27 +277,71 @@ export default function BatchList({
       width: 110,
       align: 'right',
     },
-    {
-      ...sortable('created_at'),
-      title: heading(<CalendarOutlined aria-hidden />, 'Created'),
-      dataIndex: 'created_at',
-      width: 150,
-      render: dateTime,
-    },
-    {
-      ...sortable('updated_at'),
-      title: heading(<ClockCircleOutlined aria-hidden />, 'Activity'),
-      dataIndex: 'updated_at',
-      width: 165,
-      render: dateTime,
-    },
-    {
-      ...sortable('status'),
-      title: heading(<TagsOutlined aria-hidden />, 'Status'),
-      dataIndex: 'status',
-      width: 140,
-      render: batchStatus,
-    },
+    ...(status === 'rework'
+      ? [
+          {
+            ...sortable('returned_at'),
+            title: heading(<RollbackOutlined aria-hidden />, 'Returned at'),
+            dataIndex: 'qc_returned_at',
+            width: 165,
+            render: dateTime,
+          },
+        ]
+      : [
+          {
+            ...sortable('created_at'),
+            title: heading(<CalendarOutlined aria-hidden />, 'Created'),
+            dataIndex: 'created_at',
+            width: 150,
+            render: dateTime,
+          },
+          {
+            ...sortable('updated_at'),
+            title: heading(<ClockCircleOutlined aria-hidden />, 'Activity'),
+            dataIndex: 'updated_at',
+            width: 165,
+            render: dateTime,
+          },
+          {
+            ...sortable(workflowView ? 'workflow_status' : 'status'),
+            title: heading(<TagsOutlined aria-hidden />, workflowView ? 'Stage' : 'Status'),
+            dataIndex: workflowView ? 'workflow_status' : 'status',
+            width: workflowView ? 220 : 140,
+            render: (value, batch) =>
+              workflowView ? (
+                <Tag
+                  color={
+                    value === 'operator_preparation'
+                      ? 'error'
+                      : value === 'approved'
+                        ? 'success'
+                        : 'processing'
+                  }
+                  icon={
+                    value === 'operator_preparation' ? (
+                      <ExclamationCircleOutlined aria-hidden />
+                    ) : undefined
+                  }
+                  style={{ whiteSpace: 'normal' }}
+                >
+                  {value === 'qc_in_review'
+                    ? batch.qc_claim_live
+                      ? `QC — ${batch.qc_reviewer || 'In review'}`
+                      : 'QC claim expired'
+                    : value === 'operator_preparation' &&
+                        ['queued', 'running', 'paused'].includes(batch.ocr_status)
+                      ? `Not sent to QC · OCR ${batch.ocr_status}`
+                      : workflowLabels[value] || value?.replaceAll('_', ' ') || 'Awaiting QC'}
+                </Tag>
+              ) : batch.workflow_status === 'rework' ? (
+                <Tooltip title={batch.qc_return_reason || 'Review QC findings'}>
+                  <Tag color="warning">Returned from QC</Tag>
+                </Tooltip>
+              ) : (
+                batchStatus(value)
+              ),
+          },
+        ]),
     {
       ...sortable('assigned_operator'),
       title: heading(<UserOutlined aria-hidden />, 'Operator'),
@@ -232,7 +351,8 @@ export default function BatchList({
     },
     {
       title: heading(<FolderOpenOutlined aria-hidden />, 'Actions'),
-      width: administrative ? 290 : 240,
+      width: administrative ? 290 : tracking ? 64 : status === 'rework' ? 88 : 112,
+      align: administrative ? 'left' : 'center',
       fixed: 'right',
       render: (_, batch) =>
         administrative ? (
@@ -249,20 +369,50 @@ export default function BatchList({
               Reassign
             </Button>
           </Space>
+        ) : tracking ? (
+          <IconButton
+            label="View document"
+            icon={<EyeOutlined aria-hidden />}
+            type="text"
+            disabled={creating || loading}
+            onClick={() => onDocument(batch.id)}
+          />
         ) : (
           <Space size={4}>
-            {onDocument && (
-              <Button
-                type="link"
+            {onDocument && batch.workflow_status !== 'rework' && (
+              <IconButton
+                label="Prepare document"
+                icon={<FileTextOutlined aria-hidden />}
+                type="text"
                 disabled={creating || loading}
                 onClick={() => onDocument(batch.id)}
-              >
-                {batch.workflow_status === 'rework' ? 'QC findings' : 'Metadata / QC'}
-              </Button>
+              />
             )}
-            <Button type="link" disabled={creating || loading} onClick={() => onOpen(batch)}>
-              {batch.status === 'capture_completed' ? 'View details' : 'Resume'}
-            </Button>
+            <IconButton
+              type="text"
+              disabled={creating || loading}
+              onClick={() =>
+                batch.workflow_status === 'rework' && batch.status === 'capture_completed'
+                  ? onDocument(batch.id)
+                  : onOpen(batch)
+              }
+              label={
+                batch.workflow_status === 'rework'
+                  ? 'Continue rework'
+                  : batch.status === 'capture_completed'
+                    ? 'View details'
+                    : 'Resume'
+              }
+              icon={
+                batch.workflow_status === 'rework' ? (
+                  <RollbackOutlined aria-hidden />
+                ) : batch.status === 'capture_completed' ? (
+                  <EyeOutlined aria-hidden />
+                ) : (
+                  <PlayCircleOutlined aria-hidden />
+                )
+              }
+            />
             {batch.assigned_operator_id === userId &&
               ['in_progress', 'paused'].includes(batch.status) && (
                 <Popconfirm
@@ -273,9 +423,13 @@ export default function BatchList({
                   okButtonProps={{ danger: true }}
                   onConfirm={() => deleteBatch(batch)}
                 >
-                  <Button type="link" danger disabled={creating || loading}>
-                    Delete
-                  </Button>
+                  <IconButton
+                    label="Delete batch"
+                    icon={<DeleteOutlined aria-hidden />}
+                    type="text"
+                    danger
+                    disabled={creating || loading}
+                  />
                 </Popconfirm>
               )}
           </Space>
@@ -332,17 +486,65 @@ export default function BatchList({
       </div>
       {error && <Alert type="error" showIcon title={error} />}
       <Tabs
+        className="worklist-tabs"
         activeKey={status}
         onChange={(value) => {
-          setQuery({ status: value, page: 1 });
+          const stageView = ['capture_completed', 'submitted', 'completed'].includes(value);
+          setQuery({
+            status: value,
+            page: 1,
+            sort:
+              value === 'rework'
+                ? 'returned_at'
+                : sort === 'returned_at'
+                  ? 'updated_at'
+                  : ['status', 'workflow_status'].includes(sort)
+                    ? stageView
+                      ? 'workflow_status'
+                      : 'status'
+                    : sort,
+            direction: value === 'rework' ? 'desc' : direction,
+          });
         }}
-        items={['in_progress', 'paused', 'capture_completed'].map((key) => ({
+        items={[
+          'in_progress',
+          'paused',
+          'capture_completed',
+          'rework',
+          'submitted',
+          'completed',
+        ].map((key) => ({
           key,
-          label: {
-            in_progress: 'In Progress',
-            paused: 'Paused',
-            capture_completed: 'Capture Completed',
+          icon: {
+            in_progress: <ScanOutlined aria-hidden />,
+            paused: <PauseCircleOutlined aria-hidden />,
+            capture_completed: <CheckCircleOutlined aria-hidden />,
+            rework: <RollbackOutlined aria-hidden />,
+            submitted: <SendOutlined aria-hidden />,
+            completed: <HistoryOutlined aria-hidden />,
           }[key],
+          label: (
+            <Space size={6}>
+              <span>
+                {
+                  {
+                    in_progress: 'In Progress',
+                    paused: 'Paused',
+                    capture_completed: 'Capture Completed',
+                    rework: 'Returned from QC',
+                    submitted: 'Submitted / Tracking',
+                    completed: 'Completed history',
+                  }[key]
+                }
+              </span>
+              <Badge
+                count={result.counts?.[key] ?? 0}
+                showZero
+                size="small"
+                color={key === 'rework' ? undefined : '#667386'}
+              />
+            </Space>
+          ),
         }))}
       />
       <WorklistTable
@@ -351,7 +553,9 @@ export default function BatchList({
         loading={loading}
         dataSource={result.batches}
         columns={columns}
-        scroll={{ x: administrative ? 1500 : 1400 }}
+        scroll={{
+          x: status === 'rework' ? (administrative ? 1060 : 860) : administrative ? 1380 : 1180,
+        }}
         totals={[
           { label: 'batches', value: result.total, icon: <FileTextOutlined aria-hidden /> },
           { label: 'pages', value: result.pages, icon: <FileImageOutlined aria-hidden /> },
@@ -359,7 +563,7 @@ export default function BatchList({
         ]}
         onChange={(_pagination, _filters, next) =>
           setQuery({
-            sort: next.order ? next.columnKey : 'updated_at',
+            sort: next.order ? next.columnKey : status === 'rework' ? 'returned_at' : 'updated_at',
             direction: next.order === 'ascend' ? 'asc' : 'desc',
             page: 1,
           })
@@ -374,7 +578,17 @@ export default function BatchList({
           emptyText: (
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description="No batches in this status. Create a batch or choose another tab."
+              description={
+                status === 'completed'
+                  ? 'No final-approved batches. Final approval is not implemented yet; QC-passed work stays in Submitted / Tracking.'
+                  : status === 'submitted'
+                    ? 'No submitted batches match this view.'
+                    : status === 'capture_completed'
+                      ? 'No completed captures awaiting operator preparation or Send to QC.'
+                      : status === 'rework'
+                        ? 'No returned batches match this view.'
+                        : 'No batches in this status. Create a batch or choose another tab.'
+              }
             />
           ),
         }}

@@ -32,7 +32,7 @@ export function BatchIdHeading() {
   );
 }
 
-export function BatchIdentity({ value, children }) {
+export function BatchIdentity({ value }) {
   return (
     <Typography.Text
       className="worklist-batch-id"
@@ -44,9 +44,7 @@ export function BatchIdentity({ value, children }) {
         ],
         tooltips: [`${value} · Click to copy batch ID`, 'Batch ID copied'],
       }}
-    >
-      {children}
-    </Typography.Text>
+    />
   );
 }
 

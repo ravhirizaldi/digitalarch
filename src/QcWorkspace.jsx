@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
+  App,
   Button,
   Checkbox,
   Descriptions,
@@ -25,6 +26,7 @@ import {
   ClearOutlined,
   ClockCircleOutlined,
   DeleteOutlined,
+  ExclamationCircleOutlined,
   EyeOutlined,
   FileImageOutlined,
   FileSearchOutlined,
@@ -38,6 +40,7 @@ import {
   SafetyCertificateOutlined,
   ScanOutlined,
   SearchOutlined,
+  SendOutlined,
   TagsOutlined,
   UndoOutlined,
   UserOutlined,
@@ -46,6 +49,8 @@ import { api } from './api';
 import { dateTime, IconButton, Thumbnail } from './ui';
 import WorklistTable, { BatchIdentity, BatchIdHeading, ColumnHeading } from './WorklistTable';
 import PageViewer from './PageViewer';
+import PageLabelEditor from './PageLabelEditor';
+import { pageName } from './pageLabels';
 import MetadataPanel, { metadataTypeLabels } from './MetadataPanel';
 import { queryChoice, queryPage, queryZoom, useUrlState } from './useUrlState';
 
@@ -138,12 +143,24 @@ const categories = [
   'incomplete_document',
   'other',
 ];
-const label = (value) => value?.replaceAll('_', ' ') || '—';
+const label = (value) =>
+  ({
+    operator_preparation: 'Not sent to QC',
+    qc_waiting: 'Waiting for QC',
+    qc_in_review: 'QC review',
+    rework: 'Returned from QC',
+    awaiting_approval_l1: 'Awaiting L1',
+  })[value] ||
+  value?.replaceAll('_', ' ') ||
+  '—';
 const activityLabels = {
   'qc.claimed': 'Document claimed',
   'qc.released': 'Claim released',
   'qc.reassigned': 'Claim released for reassignment',
   'qc.ready': 'Ready for QC',
+  'qc.submitted': 'Sent to QC',
+  'qc.resubmitted': 'Resubmitted to QC',
+  'qc.preparation_restored': 'Operator preparation restored',
   'qc.saved': 'Review draft saved',
   'qc.returned': 'Returned to operator',
   'qc.passed': 'QC passed',
@@ -530,7 +547,10 @@ export default function QcWorkspace({
   onDirtyChange,
   onStatusChange,
 }) {
+  const { notification } = App.useApp();
+  const noticeSignature = useRef('');
   const lastInteraction = useRef(Date.now());
+  const documentRequest = useRef(0);
   const [data, setData] = useState(null);
   const [viewState, setViewState] = useUrlState(readDocumentState);
   const {
@@ -567,10 +587,95 @@ export default function QcWorkspace({
   const editable =
     mine ||
     (operator &&
-      ['capturing', 'preparing', 'qc_waiting', 'rework'].includes(data?.document.workflow_status));
+      ['capturing', 'operator_preparation', 'rework'].includes(data?.document.workflow_status));
   const dirty = metadataDirty || reviewDirty || textDirty;
+  useEffect(() => {
+    const key = `document-workflow-${batchId}`;
+    return () => notification.destroy(key);
+  }, [batchId, notification]);
+  useEffect(() => {
+    if (!data) return;
+    const workflow = data.document.workflow_status;
+    const ocrStatus = data.batch.ocr_status;
+    const finished = ['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(
+      ocrStatus,
+    );
+    let notice;
+    if (operator && ['operator_preparation', 'rework'].includes(workflow)) {
+      const send = workflow === 'rework' ? 'Resubmit to QC' : 'Send to QC';
+      notice = {
+        type: ['paused', 'failed', 'cancelled', 'completed_with_errors'].includes(ocrStatus)
+          ? 'warning'
+          : 'info',
+        title: workflow === 'rework' ? 'Not resubmitted to QC' : 'Not sent to QC',
+        description:
+          data.batch.status !== 'capture_completed'
+            ? 'Finish capture first, then wait for OCR and resubmit to QC.'
+            : !finished
+              ? `OCR ${label(ocrStatus || 'not_queued')}. Wait for completion, or resume paused OCR in the OCR workspace.`
+              : `${ocrStatus !== 'completed' ? 'OCR finished with warnings. ' : ''}Editing is optional. ${send} when ready; QC can fill any gaps.`,
+      };
+    } else if (workflow === 'qc_waiting' || (operator && workflow === 'preparing')) {
+      notice = {
+        type: 'info',
+        title: operator ? 'Sent to QC' : 'Waiting for QC',
+        description: operator
+          ? 'Waiting for a reviewer. Operator edits are locked until QC returns the document.'
+          : 'Claim document before making corrections. Fill missing metadata and review the pages before QC Pass.',
+      };
+    } else if (workflow === 'awaiting_approval_l1') {
+      notice = {
+        type: 'info',
+        title: 'QC passed',
+        description: 'Reviewed revision locked. L1/L2 approval is not implemented yet.',
+      };
+    } else if (workflow === 'qc_in_review' && !mine) {
+      notice = {
+        type: 'info',
+        title: 'Read-only review',
+        description: `${review?.reviewer || 'QC Officer'} · Claim expires ${dateTime(review?.claim_expires_at)}`,
+      };
+    }
+    if (workflow === 'rework') {
+      notice = {
+        ...notice,
+        type: 'warning',
+        title: 'Returned by QC',
+        description: `${review?.decision_reason || 'Review findings'}${notice ? `\n\n${notice.description}` : ''}`,
+        actions: <Button onClick={() => setViewState({ tab: 'issues' })}>View findings</Button>,
+      };
+    }
+    const key = `document-workflow-${batchId}`;
+    const signature = JSON.stringify([
+      batchId,
+      data.document.review_cycle,
+      notice?.type,
+      notice?.title,
+      workflow === 'qc_in_review' ? review?.claimed_by : notice?.description,
+    ]);
+    if (signature === noticeSignature.current) return;
+    noticeSignature.current = signature;
+    if (notice)
+      notification.open({
+        ...notice,
+        key,
+        className: 'document-workflow-notification',
+        styles: {
+          description: {
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            maxHeight: 'min(40vh, 320px)',
+            overflowY: 'auto',
+          },
+        },
+        duration: notice.type === 'warning' ? 0 : 8,
+        role: notice.type === 'warning' ? 'alert' : 'status',
+      });
+    else notification.destroy(key);
+  }, [batchId, data, operator, mine, review, notification, setViewState]);
   const load = useCallback(
     async (keepDraft = false, resumeClaim = false) => {
+      const request = ++documentRequest.current;
       let next = await api(`/api/qc/${batchId}`);
       if (
         resumeClaim &&
@@ -581,6 +686,7 @@ export default function QcWorkspace({
         await api(`/api/qc/${batchId}/claim`, { version: next.document.version });
         next = await api(`/api/qc/${batchId}`);
       }
+      if (request !== documentRequest.current) return next;
       setData(next);
       if (!keepDraft) {
         setDraft(next.reviews[0] || null);
@@ -592,13 +698,24 @@ export default function QcWorkspace({
     [batchId, user.id, canReview],
   );
   useEffect(() => {
+    const requests = documentRequest;
     load(false, true).catch((e) => setError(e.message));
+    return () => {
+      requests.current++;
+    };
   }, [load]);
+  useEffect(() => {
+    if (!operator || dirty || working) return;
+    const timer = setInterval(() => {
+      if (!document.hidden) load(true).catch((e) => setError(e.message));
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [operator, dirty, working, load]);
   useEffect(() => {
     if (data) {
       onStatusChange({
         batchId,
-        text: `${data.pages.filter((p) => !p.is_excluded && !p.replacement_candidate).length} included pages · ${data.pages.filter((p) => p.review_status === 'reviewed' && p.reviewed_image_revision === p.image_revision).length} reviewed · ${data.findings.filter((f) => !['resolved', 'waived'].includes(f.status)).length} unresolved findings · Cycle ${data.document.review_cycle} · Revision ${data.document.revision}`,
+        text: `${data.pages.filter((p) => !p.is_excluded && !p.replacement_candidate).length} included pages · ${data.pages.filter((p) => p.review_status === 'reviewed' && p.reviewed_image_revision === p.image_revision).length} reviewed · ${data.findings.filter((f) => !['resolved', 'waived'].includes(f.status)).length} unresolved findings · ${data.document.workflow_status === 'operator_preparation' ? 'Not sent to QC' : `Cycle ${data.document.review_cycle}`} · Revision ${data.document.revision}`,
       });
     }
     return () => onStatusChange(null);
@@ -622,13 +739,14 @@ export default function QcWorkspace({
     setTextDirty(false);
   }, [batchId, page?.id]);
   useEffect(() => {
+    if (textDirty) return;
     const requests = pageRequest;
     setPageInfo(null);
     loadPage().catch((e) => setError(e.message));
     return () => {
       requests.current++;
     };
-  }, [loadPage]);
+  }, [loadPage, data?.batch.ocr_status, textDirty]);
   useEffect(() => {
     if (data && page && selected !== page.id)
       setViewState(
@@ -730,8 +848,10 @@ export default function QcWorkspace({
       selectPage(p.id);
     }
   }
-  async function pageAction(operation, beforePageId) {
-    if (mine) return action('page-edit', { pageId: page.id, action: operation, beforePageId });
+  async function pageAction(operation, beforePageId, label) {
+    const rename = operation === 'rename' ? { label } : {};
+    if (mine)
+      return action('page-edit', { pageId: page.id, action: operation, beforePageId, ...rename });
     setWorking(true);
     setError('');
     try {
@@ -744,11 +864,32 @@ export default function QcWorkspace({
       else
         await api(
           `/api/pages/${page.id}`,
-          { version: data.batch.version, action: operation === 'exclude' ? 'remove' : operation },
+          {
+            version: data.batch.version,
+            action: operation === 'exclude' ? 'remove' : operation,
+            ...rename,
+          },
           'PATCH',
         );
       await load();
       await loadPage();
+      return true;
+    } catch (e) {
+      setError(e.message);
+      return false;
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function submit() {
+    setWorking(true);
+    setError('');
+    try {
+      await api(
+        `/api/batches/${batchId}/${data.document.workflow_status === 'rework' ? 'resubmit-qc' : 'submit-qc'}`,
+        { version: data.batch.version },
+      );
+      await load();
     } catch (e) {
       setError(e.message);
     } finally {
@@ -781,8 +922,17 @@ export default function QcWorkspace({
   }
   if (!data) return error ? <Alert type="error" title={error} /> : <Spin />;
   const captureMutable =
-    operator && ['capturing', 'rework'].includes(data.document.workflow_status);
-  const pageMutable = mine || captureMutable;
+    operator &&
+    ['in_progress', 'paused'].includes(data.batch.status) &&
+    ['capturing', 'rework'].includes(data.document.workflow_status);
+  const pageMutable = editable;
+  const preparing =
+    operator && ['operator_preparation', 'rework'].includes(data.document.workflow_status);
+  const ocrFinished = ['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(
+    data.batch.ocr_status,
+  );
+  const sendLabel = data.document.workflow_status === 'rework' ? 'Resubmit to QC' : 'Send to QC';
+  const sendBlocked = dirty || working || data.batch.status !== 'capture_completed' || !ocrFinished;
   const ocr = pageInfo?.ocr;
   const processing = ocr?.processing_config;
   const notes = (
@@ -884,7 +1034,8 @@ export default function QcWorkspace({
           metadataPath={`/api/batches/${batchId}/metadata`}
           canManage={editable}
           canVerify={mine}
-          pageNumbers={Object.fromEntries(data.pages.map((p) => [p.id, p.display_order]))}
+          refreshVersion={data.metadata.version}
+          pageNames={Object.fromEntries(data.pages.map((p) => [p.id, pageName(p)]))}
           onDirtyChange={setMetadataDirty}
           onSaved={() => load(true).catch((e) => setError(e.message))}
           expandedEvidence={viewState.evidence.split(',')}
@@ -1043,14 +1194,15 @@ export default function QcWorkspace({
             <>
               <div className="qc-section-heading">
                 <h3>Page details</h3>
-                <Tag>Page {page.display_order}</Tag>
+                <Tag>{page.page_number != null ? `Page ${page.page_number}` : 'Excluded'}</Tag>
               </div>
               <Descriptions
                 bordered
                 column={1}
                 size="small"
                 items={[
-                  ['Logical position', page.display_order],
+                  ['Page label', pageName(page)],
+                  ['Logical position', page.page_number ?? 'Not included'],
                   ['Immutable capture order', page.capture_order],
                   ['Session', page.session_number],
                   ['Source', page.source],
@@ -1106,7 +1258,7 @@ export default function QcWorkspace({
                         .filter((p) => p.id !== page.id)
                         .map((p) => ({
                           value: p.id,
-                          label: `Page ${p.display_order} · Session ${p.session_number}`,
+                          label: `${pageName(p)} · Session ${p.session_number}`,
                         }))}
                     />
                   </Space>
@@ -1198,7 +1350,7 @@ export default function QcWorkspace({
               <p>{f.description}</p>
               {f.page_ids.map((id) => (
                 <Button key={id} type="link" onClick={() => selectPage(id)}>
-                  Page {data.pages.find((p) => p.id === id)?.display_order || '—'}
+                  {pageName(data.pages.find((p) => p.id === id))}
                 </Button>
               ))}
               {f.metadata_field_id && (
@@ -1245,12 +1397,12 @@ export default function QcWorkspace({
             <h3>Review cycles</h3>
           </div>
           {!data.reviews.length && (
-            <p className="qc-panel-caption">Review history begins after capture is completed.</p>
+            <p className="qc-panel-caption">Review history begins after Send to QC.</p>
           )}
           <ol className="qc-history-list qc-review-cycles">
             {data.reviews.map((r) => (
               <li key={r.id}>
-                <div className="qc-section-heading">
+                <div className="qc-history-heading">
                   <strong>Cycle {r.cycle}</strong>
                   <Tag
                     color={
@@ -1263,8 +1415,8 @@ export default function QcWorkspace({
                   >
                     {r.outcome || 'Draft'}
                   </Tag>
+                  <span className="qc-history-reviewer">{r.reviewer || 'Unclaimed'}</span>
                 </div>
-                <span>{r.reviewer || 'Unclaimed'}</span>
                 {r.decision_reason && <p>{r.decision_reason}</p>}
                 <div className="qc-history-meta">
                   {r.decided_at && <time>{dateTime(r.decided_at)}</time>}
@@ -1279,12 +1431,14 @@ export default function QcWorkspace({
           <ol className="qc-history-list">
             {data.history.map((h, i) => (
               <li key={i}>
-                <strong className="qc-history-action">
-                  {activityLabels[h.action] || label(h.action.replaceAll('.', ' · '))}
-                </strong>
+                <div className="qc-history-heading">
+                  <strong className="qc-history-action">
+                    {activityLabels[h.action] || label(h.action.replaceAll('.', ' · '))}
+                  </strong>
+                  <time>{dateTime(h.created_at)}</time>
+                </div>
                 <div className="qc-history-meta">
                   <span>{h.actor || 'System'}</span>
-                  <time>{dateTime(h.created_at)}</time>
                 </div>
               </li>
             ))}
@@ -1296,7 +1450,7 @@ export default function QcWorkspace({
   return (
     <section
       className="workspace qc-workspace"
-      aria-label="Document QC Workspace"
+      aria-label={operator ? 'Document preparation' : 'Document QC Workspace'}
       onKeyDown={keyDown}
       onPointerDownCapture={() => {
         lastInteraction.current = Date.now();
@@ -1310,7 +1464,16 @@ export default function QcWorkspace({
           onClick={onBack}
         />
         <h1>{data.batch.batch_code}</h1>
-        <Tag>{label(data.document.workflow_status)}</Tag>
+        <Tag
+          color={data.document.workflow_status === 'operator_preparation' ? 'error' : undefined}
+          icon={
+            data.document.workflow_status === 'operator_preparation' ? (
+              <ExclamationCircleOutlined aria-hidden />
+            ) : undefined
+          }
+        >
+          {label(data.document.workflow_status)}
+        </Tag>
         <span className="toolbar-spacer" />
         <IconButton
           label="Reload"
@@ -1327,6 +1490,25 @@ export default function QcWorkspace({
           <Button disabled={dirty || working} onClick={() => onCapture(data.batch, page?.id)}>
             Capture / rework
           </Button>
+        )}
+        {preparing && (
+          <Popconfirm
+            title={`${sendLabel}?`}
+            description="Editing is optional. QC will fill missing metadata and review the pages. Sending locks operator edits until QC returns the document."
+            okText={sendLabel}
+            cancelText="Keep preparing"
+            disabled={sendBlocked}
+            onConfirm={submit}
+          >
+            <Button
+              icon={<SendOutlined aria-hidden />}
+              type="primary"
+              disabled={sendBlocked}
+              title={dirty ? 'Save your edits before sending to QC.' : undefined}
+            >
+              {sendLabel}
+            </Button>
+          </Popconfirm>
         )}
         {can('qc:review') &&
           ['qc_waiting', 'qc_in_review'].includes(data.document.workflow_status) &&
@@ -1388,19 +1570,6 @@ export default function QcWorkspace({
         )}
       </div>
       {error && <Alert type="error" showIcon title={error} closable onClose={() => setError('')} />}
-      {data.document.workflow_status === 'rework' && (
-        <Alert
-          type="warning"
-          title={`Returned by QC: ${review?.decision_reason || 'Review findings'}`}
-          action={<Button onClick={() => setViewState({ tab: 'issues' })}>View findings</Button>}
-        />
-      )}
-      {data.document.workflow_status === 'qc_in_review' && !mine && (
-        <Alert
-          type="info"
-          title={`Read-only review · ${review?.reviewer || 'QC Officer'} · Claim expires ${dateTime(review?.claim_expires_at)}`}
-        />
-      )}
       <Splitter className="workstation-split qc-split">
         <Splitter.Panel defaultSize="18%" min={170} max="28%">
           <section className="panel page-history">
@@ -1454,18 +1623,21 @@ export default function QcWorkspace({
                   block
                   key={p.id}
                   className={`page-item scanner-page ${p.id === page?.id ? 'selected' : ''}`}
-                  aria-label={`Inspect page ${p.display_order}`}
+                  aria-label={`Inspect ${pageName(p)}`}
                   aria-pressed={p.id === page?.id}
                   onClick={() => selectPage(p.id)}
                 >
                   <Thumbnail
                     src={`/api/pages/${p.id}/thumbnail`}
-                    label={`Page ${p.display_order}`}
+                    label={pageName(p)}
                     rotation={p.rotation_degrees}
                   />
                   <span className="page-item-info">
-                    <strong>Page {p.display_order}</strong>
-                    <span>Session {p.session_number}</span>
+                    <strong title={pageName(p)}>{pageName(p)}</strong>
+                    <span>
+                      {p.page_label && p.page_number != null ? `Page ${p.page_number} · ` : ''}
+                      Session {p.session_number}
+                    </span>
                     <span>
                       {p.is_excluded
                         ? 'Excluded'
@@ -1499,7 +1671,9 @@ export default function QcWorkspace({
                   disabled={index <= 0 || working}
                   onClick={() => nextPage(-1)}
                 />
-                <h2>{page ? `Page ${page.display_order}` : 'Preview'}</h2>
+                <h2 className="page-preview-title" title={page && pageName(page)}>
+                  {page ? pageName(page) : 'Preview'}
+                </h2>
                 <IconButton
                   label="Next page"
                   icon={<RightOutlined aria-hidden />}
@@ -1509,6 +1683,13 @@ export default function QcWorkspace({
               </Space>
               {page && pageMutable && (
                 <Space size={4}>
+                  <PageLabelEditor
+                    key={page.id}
+                    page={page}
+                    disabled={working || dirty}
+                    error={error}
+                    onSave={(label) => pageAction('rename', undefined, label)}
+                  />
                   <IconButton
                     label="Rotate left"
                     icon={<RotateLeftOutlined aria-hidden />}
@@ -1714,7 +1895,7 @@ export default function QcWorkspace({
                 optionFilterProp="label"
                 value={issue.pageIds}
                 onChange={(pageIds) => setIssue({ ...issue, pageIds })}
-                options={data.pages.map((p) => ({ value: p.id, label: `Page ${p.display_order}` }))}
+                options={data.pages.map((p) => ({ value: p.id, label: pageName(p) }))}
               />
             </Form.Item>
             <Form.Item label="Metadata field (optional)">

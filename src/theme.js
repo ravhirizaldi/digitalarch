@@ -40,6 +40,7 @@ export const enterpriseTheme = {
     Tabs: { horizontalMargin: '0 0 8px 0', horizontalItemGutter: 20 },
     Drawer: { footerPaddingBlock: 8, footerPaddingInline: 12 },
     Modal: { paddingContentHorizontalLG: 16 },
+    Notification: { width: 360, fontSizeLG: 13, paddingMD: 12, paddingLG: 12 },
     Splitter: { splitBarSize: 6, splitTriggerSize: 2 },
   },
 };

@@ -17,7 +17,7 @@ test('database: vector, migration idempotency, UUID relationships, constraints, 
   );
   await migrate(f.pool);
   await migrate(f.pool);
-  assert.equal((await f.pool.query('SELECT * FROM schema_migrations')).rowCount, 11);
+  assert.equal((await f.pool.query('SELECT * FROM schema_migrations')).rowCount, 14);
   const operator = await f.account();
   const a = (await operator.request('/api/batches', { physicalLocation: 'Rack A-12' })).body;
   const b = (await operator.request('/api/batches', { physicalLocation: 'Rack A-12' })).body;
@@ -43,6 +43,126 @@ test('database: vector, migration idempotency, UUID relationships, constraints, 
   );
 });
 
+test('page labels and numbering survive removals, rescans, reorder, reset and restoration', async (t) => {
+  const f = await testApplication(t);
+  const operator = await f.account();
+  let capture = (await operator.request('/api/batches', {})).body;
+  for (const scenario of ['multi', 'multi', 'multi', 'single'])
+    capture = await scanned(operator, capture.batch, { scenario, pageDelay: 0 });
+  assert.equal(capture.pages.length, 10);
+  const originals = capture.pages.map(({ id, capture_order, sha256, original_storage_key }) => ({
+    id,
+    capture_order,
+    sha256,
+    original_storage_key,
+  }));
+  const first = capture.pages[0];
+  async function edit(id, action, label) {
+    const response = await operator.request(
+      `/api/pages/${id}`,
+      {
+        version: capture.batch.version,
+        action,
+        ...(action === 'rename' ? { label } : {}),
+      },
+      'PATCH',
+    );
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    capture = response.body;
+  }
+  const included = () => capture.pages.filter((p) => !p.is_excluded && !p.replacement_candidate);
+  const numbers = () => included().map((p) => p.page_number);
+  await edit(first.id, 'rename', '  Cover  ');
+  assert.equal(capture.pages[0].page_label, 'Cover');
+  assert.equal(capture.pages[0].image_revision, first.image_revision);
+  for (const page of capture.pages.slice(5)) await edit(page.id, 'remove');
+  assert.deepEqual(numbers(), [1, 2, 3, 4, 5]);
+  assert.ok(capture.pages.filter((p) => p.is_excluded).every((p) => p.page_number === null));
+  for (const scenario of ['multi', 'single', 'single'])
+    capture = await scanned(operator, capture.batch, { scenario, pageDelay: 0 });
+  assert.deepEqual(numbers(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.deepEqual(
+    included()
+      .slice(5)
+      .map((p) => p.capture_order),
+    [11, 12, 13, 14, 15],
+  );
+  const last = included().at(-1);
+  const moved = await operator.request(`/api/batches/${capture.batch.id}/reorder`, {
+    version: capture.batch.version,
+    pageId: last.id,
+    beforePageId: first.id,
+  });
+  assert.equal(moved.status, 200);
+  capture = moved.body;
+  assert.equal(included()[0].id, last.id);
+  assert.equal(included()[1].page_label, 'Cover');
+  assert.equal(included()[1].page_number, 2);
+  await edit(first.id, 'rename', null);
+  assert.equal(included()[1].page_label, null);
+  for (const page of included()) await edit(page.id, 'remove');
+  assert.deepEqual(numbers(), []);
+  capture = await scanned(operator, capture.batch, { scenario: 'single', pageDelay: 0 });
+  assert.deepEqual(numbers(), [1]);
+  assert.equal(included()[0].capture_order, 16);
+  await edit(first.id, 'restore');
+  assert.deepEqual(numbers(), [1, 2]);
+  assert.equal(included()[0].id, first.id);
+  assert.deepEqual(
+    capture.pages
+      .filter((p) => originals.some((o) => o.id === p.id))
+      .sort((a, b) => a.capture_order - b.capture_order)
+      .map(({ id, capture_order, sha256, original_storage_key }) => ({
+        id,
+        capture_order,
+        sha256,
+        original_storage_key,
+      })),
+    originals,
+  );
+  const reopened = (await operator.request(`/api/batches/${capture.batch.id}`)).body;
+  assert.deepEqual(reopened.pages, capture.pages);
+});
+
+test('page renaming validates input, ownership, versions, CSRF and completion locks', async (t) => {
+  const f = await testApplication(t);
+  const operator = await f.account(),
+    other = await f.account();
+  const batch = (await operator.request('/api/batches', {})).body.batch;
+  const capture = await scanned(operator, batch, { scenario: 'single', pageDelay: 0 });
+  const page = capture.pages[0];
+  const route = `/api/pages/${page.id}`;
+  const body = { version: capture.batch.version, action: 'rename', label: 'Cover' };
+  assert.equal((await other.request(route, body, 'PATCH')).status, 403);
+  assert.equal((await f.admin.request(route, body, 'PATCH')).status, 403);
+  assert.equal((await operator.request(route, body, 'PATCH', { 'X-CSRF-Token': '' })).status, 403);
+  assert.equal(
+    (await operator.request(route, { ...body, version: body.version - 1 }, 'PATCH')).status,
+    409,
+  );
+  for (const label of [42, {}, 'x'.repeat(121), '   '])
+    assert.equal((await operator.request(route, { ...body, label }, 'PATCH')).status, 400);
+  assert.equal(
+    (await operator.request(route, { version: body.version, action: 'rename' }, 'PATCH')).status,
+    400,
+  );
+  const renamed = await operator.request(route, body, 'PATCH');
+  assert.equal(renamed.status, 200);
+  const completed = await operator.request(`/api/batches/${batch.id}/complete-capture`, {
+    version: renamed.body.batch.version,
+  });
+  assert.equal(completed.status, 200);
+  assert.equal(
+    (await operator.request(route, { ...body, version: completed.body.batch.version }, 'PATCH'))
+      .status,
+    409,
+  );
+  assert.equal(
+    (await f.pool.query('SELECT page_label FROM pages WHERE id=$1', [page.id])).rows[0].page_label,
+    'Cover',
+  );
+});
+
 test('batch lists sort the full owned result and return filtered counters', async (t) => {
   const f = await testApplication(t);
   const operator = await f.account();
@@ -55,6 +175,16 @@ test('batch lists sort the full owned result and return filtered counters', asyn
   assert.equal(first.body.total, 2);
   assert.equal(first.body.pages, 0);
   assert.equal(first.body.sessions, 0);
+  assert.equal(first.body.returned, 0);
+  assert.equal(first.body.counts.in_progress, 2);
+  for (const status of ['submitted', 'completed']) {
+    const empty = await operator.request(`/api/batches?status=${status}`);
+    assert.equal(empty.status, 200);
+    assert.equal(empty.body.total, 0);
+    assert.equal(empty.body.counts[status], 0);
+  }
+  assert.equal((await operator.request('/api/batches?status=rework')).body.total, 0);
+  assert.equal((await operator.request('/api/batches?status=unknown')).status, 400);
   assert.equal(first.body.batches[0].id, a.id);
   assert.equal(
     (await operator.request('/api/batches?sort=physical_location&direction=asc&limit=1&offset=1'))

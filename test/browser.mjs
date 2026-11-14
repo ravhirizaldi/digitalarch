@@ -96,9 +96,8 @@ try {
         return (
           button &&
           !button.disabled &&
-          document
-            .querySelector('.batch-context h1')
-            ?.textContent.includes(`(Session ${session})`) &&
+          document.querySelector('[aria-label="Current scan session"]')?.textContent ===
+            `Session ${session}` &&
           document.querySelector('[aria-label="Captured page count"]')?.textContent ===
             String(count)
         );
@@ -205,9 +204,12 @@ try {
     (await f.pool.query('SELECT count(*)::int AS count FROM archive_batches')).rows[0].count,
     batchCountBefore + 1,
   );
-  const batchA = (await page.locator('.batch-context h1').innerText())
-    .split(' · ')[1]
-    .split(' (')[0];
+  const batchA = await page.locator('.batch-context h1 .ant-tag').first().innerText();
+  assert.equal(await page.locator('.batch-context h1 .ant-tag').count(), 2);
+  assert.equal(
+    (await page.locator('.batch-context h1').innerText()).includes('Active batch'),
+    false,
+  );
   assert.match(batchA, /^B-\d{8}-\d{6}-[A-F0-9]{8}$/);
   await page.getByRole('button', { name: 'Batch Info', exact: true }).click();
   await page.getByLabel('Physical location', { exact: true }).fill('Rack A-12');
@@ -303,7 +305,19 @@ try {
   assert.equal(await page.locator('.scanner-page').count(), 1);
   await page.getByRole('button', { name: 'Save & Exit', exact: true }).click();
   await page.getByRole('menuitem', { name: 'My Batches', exact: true }).click();
-  await page.getByRole('tab', { name: 'Paused', exact: true }).click();
+  await page.getByRole('tab', { name: /^Paused/ }).click();
+  assert.equal(
+    await page
+      .locator('.worklist-tabs')
+      .evaluate((element) => getComputedStyle(element).backgroundColor),
+    'rgb(255, 255, 255)',
+  );
+  assert.equal(
+    await page
+      .getByRole('columnheader', { name: /Activity/ })
+      .evaluate((element) => getComputedStyle(element).backgroundColor),
+    'rgb(255, 255, 255)',
+  );
   await page.getByRole('row').filter({ hasText: batchA }).waitFor();
   await contained('paused-batches-1280');
   await page
@@ -326,11 +340,16 @@ try {
     .getByRole('dialog')
     .getByRole('button', { name: 'Complete Capture', exact: true })
     .click();
-  await page.getByRole('heading', { name: 'Capture Workspace', exact: true }).waitFor();
-  await page.getByRole('tab', { name: 'Capture Completed', exact: true }).click();
+  await page.getByLabel('Document preparation', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Back', exact: true }).click();
+  await page.getByRole('heading', { name: 'My Batches', exact: true }).waitFor();
+  await page.getByRole('tab', { name: /^Capture Completed/ }).click();
   const completedRow = page.getByRole('row').filter({ hasText: batchA });
   await completedRow.waitFor();
-  assert.equal(await completedRow.getByRole('button', { name: 'Delete', exact: true }).count(), 0);
+  assert.equal(
+    await completedRow.getByRole('button', { name: 'Delete batch', exact: true }).count(),
+    0,
+  );
   await page
     .getByRole('row')
     .filter({ hasText: batchA })
@@ -359,7 +378,9 @@ try {
   assert.equal(await confirm.isDisabled(), true);
   await page.getByRole('checkbox').check();
   await confirm.click();
-  await page.getByRole('heading', { name: 'Capture Workspace', exact: true }).waitFor();
+  await page.getByLabel('Document preparation', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Back', exact: true }).click();
+  await page.getByRole('heading', { name: 'My Batches', exact: true }).waitFor();
   await page.route('**/api/batches', (route) =>
     route.request().method() === 'POST'
       ? route.fulfill({

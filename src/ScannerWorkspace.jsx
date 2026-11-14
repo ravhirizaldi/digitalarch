@@ -23,6 +23,8 @@ import {
   UndoOutlined,
 } from '@ant-design/icons';
 import PageViewer from './PageViewer';
+import PageLabelEditor from './PageLabelEditor';
+import { pageName } from './pageLabels';
 import { IconButton, Thumbnail, useNarrow } from './ui';
 
 export default function ScannerWorkspace({
@@ -31,6 +33,7 @@ export default function ScannerWorkspace({
   busy,
   requesting,
   networkError,
+  pageError,
   scenario,
   setScenario,
   pageDelay,
@@ -147,17 +150,20 @@ export default function ScannerWorkspace({
               block
               className={`page-item scanner-page ${item.id === page?.id ? 'selected' : ''} ${item.excluded ? 'removed' : ''}`}
               aria-pressed={item.id === page?.id}
-              aria-label={`Inspect ${item.excluded ? 'removed ' : ''}page ${item.pageNumber}`}
+              aria-label={`Inspect ${pageName(item)}`}
               onClick={() => setSelected(item.id)}
             >
               <Thumbnail
                 src={`/api/pages/${item.id}/thumbnail`}
-                label={`Page ${item.pageNumber} thumbnail`}
+                label={`${pageName(item)} thumbnail`}
                 rotation={item.rotation}
               />
               <span className="page-item-info">
-                <strong>Page {item.pageNumber}</strong>
-                <span className="muted">Session {item.sessionNumber}</span>
+                <strong title={pageName(item)}>{pageName(item)}</strong>
+                <span className="muted">
+                  {item.page_label && item.page_number != null ? `Page ${item.page_number} · ` : ''}
+                  Session {item.sessionNumber}
+                </span>
                 {item.excluded && <span>Removed</span>}
               </span>
             </Button>
@@ -186,7 +192,7 @@ export default function ScannerWorkspace({
   const preview = (
     <section className="panel preview-panel">
       <div className="panel-heading">
-        <h1>{page ? `Page ${page.pageNumber}` : 'Document preview'}</h1>
+        <h1 title={page && pageName(page)}>{page ? pageName(page) : 'Document preview'}</h1>
         {narrow && locked && (
           <IconButton
             label="Show batch pages"
@@ -199,6 +205,13 @@ export default function ScannerWorkspace({
             {page.excluded && <span className="muted">Removed</span>}
             {!locked && (
               <>
+                <PageLabelEditor
+                  key={page.id}
+                  page={page}
+                  disabled={busy || !!pending}
+                  error={pageError}
+                  onSave={(label) => onPageAction(page, 'rename', label)}
+                />
                 <IconButton
                   label="Rotate left"
                   icon={<RotateLeftOutlined />}
@@ -245,7 +258,7 @@ export default function ScannerWorkspace({
       </div>
       <PageViewer
         image={page ? { imageId: page.id } : null}
-        label={page ? `Page ${page.pageNumber}` : 'Scan preview'}
+        label={page ? pageName(page) : 'Scan preview'}
         previewUrl={page && `/api/pages/${page.id}/preview`}
         originalUrl={page?.imageUrl}
         rotation={page?.rotation || 0}
@@ -384,7 +397,7 @@ export default function ScannerWorkspace({
         </Splitter>
       )}
       <Modal
-        title={`Replace page ${page?.pageNumber || ''}`}
+        title={page ? `Replace ${pageName(page)}` : 'Replace page'}
         open={replacement}
         onCancel={() => setReplacement(false)}
         okText="Scan replacement candidates"
@@ -414,7 +427,7 @@ export default function ScannerWorkspace({
           value={candidateId}
           placeholder="Choose a captured candidate explicitly"
           onChange={setCandidateId}
-          options={candidates.map((p) => ({ value: p.id, label: `Candidate ${p.pageNumber}` }))}
+          options={candidates.map((p) => ({ value: p.id, label: pageName(p) }))}
         />
         {candidateId && candidates.some((p) => p.id === candidateId) && (
           <div className="replacement-preview">

@@ -160,14 +160,14 @@ export function editedFields(doc, body, user, verifying) {
 export async function currentOcr(client, batchId, { pageId = null, includeText = true } = {}) {
   return (
     await client.query(
-      `SELECT p.id AS page_id,p.display_order AS page_number,
-    (row_number() OVER(ORDER BY p.display_order,p.capture_order)-1)::int AS page_offset,
+      `SELECT p.id AS page_id,p.page_number,
+    p.page_number-1 AS page_offset,
     r.id AS result_id,r.status,r.is_stale,r.image_revision,r.processed_at,r.engine,r.engine_version,
     r.error_message,j.processing_config,
     ${includeText ? 'coalesce(r.extracted_text,c.extracted_text)' : 'NULL'} AS extracted_text,
     ${includeText ? 'coalesce(r.structured_result,c.structured_result)' : 'NULL'} AS structured_result,
     ${includeText ? 'correction.corrected_text' : 'NULL'} AS corrected_text,correction.id AS correction_id,correction.created_by AS corrected_by,correction.created_at AS corrected_at
-    FROM pages p LEFT JOIN LATERAL (SELECT r.* FROM page_ocr_results r JOIN ocr_jobs j ON j.id=r.ocr_job_id
+    FROM document_pages p LEFT JOIN LATERAL (SELECT r.* FROM page_ocr_results r JOIN ocr_jobs j ON j.id=r.ocr_job_id
       WHERE r.page_id=p.id AND r.image_revision=p.image_revision AND NOT r.is_stale
       ORDER BY j.created_at DESC,j.id DESC LIMIT 1) r ON true
     LEFT JOIN ocr_jobs j ON j.id=r.ocr_job_id LEFT JOIN page_ocr_results c ON c.id=r.reused_result_id

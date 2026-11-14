@@ -85,7 +85,7 @@ This downloads a project-local CPU runtime and PP-OCRv6 Small models (roughly 1.
 
 ## Document metadata and QC
 
-One batch is one logical document, even across multiple feeder sessions. Open **Document / Metadata / QC** from capture to enter optional metadata before OCR. **Complete Capture** queues the existing OCR worker and prepares a QC review; metadata extraction adds rule-based suggestions without overwriting human values.
+One batch is one logical document, even across multiple feeder sessions. Open **Prepare document** to enter optional metadata. **Complete Capture** queues OCR and opens preparation; it does not submit to QC. After OCR finishes, optionally edit metadata/pages or skip editing, then explicitly **Send to QC**. QC must claim before corrections. Returned work requires capture completion/OCR and a separate **Resubmit to QC**. Suggestions never overwrite human values. Apply migration 014 before starting the updated backend; L1/L2 decisions remain unimplemented.
 
 An independent QC Officer opens **QC Queue**, claims a document, checks pages/order/completeness, verifies metadata and saves findings. Claims expire after 30 minutes without renewal. **Return to Operator** reopens the same batch for corrections, insertion or confirmed page replacement; **Resubmit to QC** creates a new review cycle. **Pass QC** locks the reviewed revision at **Awaiting Approval Level 1**, not final approval or publication. OCR-run metadata is read-only history; current values belong to the document.
 

@@ -2,6 +2,8 @@
 
 **Planning handoff: 2026-11-14. Nothing in this document is an implemented approval/archive feature.** The current runtime stops at `awaiting_approval_l1`. Proposed names and business rules below require confirmation before implementation.
 
+The operator list now includes **Submitted / Tracking** and **Completed history** views. These are not approval queues or decisions: QC Pass remains in tracking as Awaiting L1, and final-approved history is empty under the current schema. An Awaiting L2 label does not add an L2 transition. Approval implementation must still supply the revision-bound decisions, states, permissions and locks described below.
+
 ## 1. Is the remaining work simpler?
 
 Yes, if it stays limited to two human decision gates and authenticated read-only viewing. Capture, OCR, metadata verification, image history, authentication, audit, pagination and preview components already exist. Approval should not scan, re-run OCR, rewrite metadata or create another document copy.
@@ -33,7 +35,7 @@ Approval detail is read-only except decision/note controls. No rotation, exclusi
 
 ### Proposed state extension
 
-Only `awaiting_approval_l1` and `qc_waiting` below exist today. `awaiting_approval_l2` and `approved` are proposed new states, not accepted by migration 010's current CHECK constraint.
+Only `awaiting_approval_l1` and `qc_waiting` below exist today. `awaiting_approval_l2` and `approved` are proposed new states, not accepted by migration 014's current CHECK constraint.
 
 ```mermaid
 stateDiagram-v2

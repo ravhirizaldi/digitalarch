@@ -2,6 +2,8 @@
 
 **Baseline: 2026-11-14.** This is the as-built technical handoff for the local source through capture, OCR, metadata, QC and rework. “DND” here means design and development. [DESIGN.md](DESIGN.md) owns visual rules; [APPROVAL.md](APPROVAL.md) describes proposed, unimplemented L1/L2/viewer work.
 
+**2026-11-15 extension:** migrations 012–013 add automatic included-page numbering and editable page labels, with batch-scoped numbering queries; details and permission boundaries are in [QC.md](QC.md#page-names-and-numbering). These follow-up changes remain runtime-unverified.
+
 ## 1. Delivery boundary
 
 | Area                        | Current implementation                                                                                            |
@@ -95,13 +97,15 @@ Soft deletion is a tombstone, not another capture status. Completion still has v
 ```mermaid
 stateDiagram-v2
     [*] --> capturing
-    capturing --> preparing: Complete Capture and create review cycle
-    preparing --> qc_waiting: Latest OCR terminal and metadata prepared
+    capturing --> operator_preparation: Complete Capture and queue OCR
+    operator_preparation --> operator_preparation: OCR and optional edits, no handoff
+    operator_preparation --> qc_waiting: Explicit Send to QC after terminal OCR
     qc_waiting --> qc_in_review: Independent officer claims
     qc_in_review --> qc_waiting: Release or administrative release
     qc_in_review --> qc_in_review: Renew or reclaim expired lease
     qc_in_review --> rework: Return with reason
-    rework --> preparing: Resubmit and create next review cycle
+    rework --> rework: Complete Capture and finish OCR
+    rework --> qc_waiting: Explicit resubmission and next review cycle
     qc_in_review --> awaiting_approval_l1: Pass guards and save snapshot
     note right of awaiting_approval_l1
         Current implementation stops here.
@@ -109,7 +113,7 @@ stateDiagram-v2
     end note
 ```
 
-Lease expiry alone does not change `qc_in_review` to `qc_waiting`: the waiting queue includes expired reviews and permits a version-checked reclaim. A cancelled/failed terminal OCR job can make a document ready for human QC, but does not automatically satisfy QC Pass.
+Lease expiry alone does not change `qc_in_review` to `qc_waiting`: the waiting queue includes expired reviews and permits a version-checked reclaim. Terminal failed/cancelled OCR permits explicit submission with warnings, not automatic handoff or QC Pass. The legacy `preparing` state remains supported only for already-submitted pre-014 work.
 
 ### OCR state: `ocr_jobs.status` and batch OCR summary
 
@@ -122,6 +126,7 @@ Jobs use `queued`, `running`, `paused`, `completed`, `completed_with_errors`, `f
 - `documents.revision` identifies reviewed content. `pages.image_revision` identifies an effective page-image generation. `qc_reviews.cycle` identifies a review attempt. A new cycle does not delete older findings/decisions.
 - Current metadata lives on `documents.metadata_json`; per-run `document_metadata` remains read-only history. Human OCR corrections append separately from machine results.
 - Capture/order/source originals are immutable. Logical display order, rotation, exclusion and confirmed replacement references are separate. See [ERD.md](ERD.md) for physical relationships and JSON-reference limitations.
+- `document_pages.page_number` is a derived contiguous included-document position, not stored `pages.display_order` or immutable `capture_order`. Optional `pages.page_label` overrides the default Page N name without changing any identity, order or file. Capture/QC/metadata evidence use the same projection; OCR history retains capture-order pagination while displaying current names. New QC snapshots retain the labels/numbers as reviewed.
 
 ## 6. Mutation and concurrency contract
 
@@ -139,22 +144,33 @@ Expected failures are actionable: stale version or lost claim requires reload/re
 
 This is a route-family index, not a new API or a promise that every role can read every family. `server/enterprise.mjs` and service-level checks are authoritative.
 
-| Family                                                                     | Contract                                                                                                                            |
-| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/auth/login`, `/me`, `/logout`, `/change-password`                    | Session bootstrap, rotation and onboarding                                                                                          |
-| `/api/batches`                                                             | Create or list authorized batches; list returns `batches`, filtered `total/pages/sessions`, recent actor activity                   |
-| `/api/batches/:batchId` and action suffixes                                | Capture detail, pause/resume/completion, session allocation, resubmission, replacement/reorder and soft deletion                    |
-| `/api/batches/:batchId/metadata`                                           | GET current metadata; PATCH fields with metadata `version`; POST `/extract` refreshes candidates                                    |
-| `/api/qc/queue`                                                            | Queue results with filtered `total/pages/sessions` and separate queue-wide `counts`                                                 |
-| `/api/qc/:batchId`                                                         | Document, pages, sessions, current metadata, review cycles, findings and activity                                                   |
-| `/api/qc/:batchId/:action`                                                 | Claim/release/heartbeat/save/pass/return/findings/page review/edit/text correction/policy/reprocessing; document `version` required |
-| `/api/qc/:batchId/pages/:pageId`                                           | Current page OCR/correction information and image revision history                                                                  |
-| `/api/qc/:batchId/pages/:pageId/revisions/:revisionId/image` or `/preview` | Authorized historical image access                                                                                                  |
-| `/api/ocr/jobs` and job/page routes                                        | OCR jobs, controls, results and images; old run metadata GET only                                                                   |
-| `/api/settings/ocr`                                                        | Administrator defaults with optimistic version checks                                                                               |
-| `/api/admin/*`                                                             | Users, roles, reassignment, audit and sanitized system information                                                                  |
+| Family                                                                     | Contract                                                                                                                                                                           |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/auth/login`, `/me`, `/logout`, `/change-password`                    | Session bootstrap, rotation and onboarding                                                                                                                                         |
+| `/api/batches`                                                             | Create or list authorized batches; list returns `batches`, filtered `total/pages/sessions`, access-scoped per-view `counts`, compatible `returned` count and recent actor activity |
+| `/api/batches/:batchId` and action suffixes                                | Capture detail, pause/resume/completion, session allocation, resubmission, replacement/reorder and soft deletion                                                                   |
+| `/api/batches/:batchId/submit-qc` and `/resubmit-qc`                       | Explicit owner handoff after completed capture and terminal OCR; batch `version` required, metadata optional, sender/time audited                                                  |
+| `/api/batches/:batchId/metadata`                                           | GET current metadata; PATCH fields with metadata `version`; POST `/extract` refreshes candidates                                                                                   |
+| `/api/qc/queue`                                                            | Queue results with filtered `total/pages/sessions` and separate queue-wide `counts`                                                                                                |
+| `/api/qc/:batchId`                                                         | Document, pages, sessions, current metadata, review cycles, findings and activity                                                                                                  |
+| `/api/qc/:batchId/:action`                                                 | Claim/release/heartbeat/save/pass/return/findings/page review/edit/text correction/policy/reprocessing; document `version` required                                                |
+| `/api/qc/:batchId/pages/:pageId`                                           | Current page OCR/correction information and image revision history                                                                                                                 |
+| `/api/qc/:batchId/pages/:pageId/revisions/:revisionId/image` or `/preview` | Authorized historical image access                                                                                                                                                 |
+| `/api/ocr/jobs` and job/page routes                                        | OCR jobs, controls, results and images; old run metadata GET only                                                                                                                  |
+| `/api/settings/ocr`                                                        | Administrator defaults with optimistic version checks                                                                                                                              |
+| `/api/admin/*`                                                             | Users, roles, reassignment, audit and sanitized system information                                                                                                                 |
 
 QC list parameters are `filter`, `search`, `metadata`, `ocr`, `sort`, `direction`, `limit` and `offset`. Batch lists use `status`, `search`, `sort`, `direction`, `limit` and `offset`. Sort identifiers are mapped through SQL allowlists; input is never interpolated as an arbitrary column. Current list limits are at most 100 and offsets at most 1,000,000. OCR APIs and settings are detailed in [OCR.md](OCR.md).
+
+Batch-list `status` selects work/tracking views without changing `archive_batches.status`:
+
+- `in_progress` / `paused`: underlying capture status, excluding document rework.
+- `capture_completed`: completed capture without a submitted current review cycle, excluding rework/final approval.
+- `rework`: current document rework; returns current-cycle `qc_return_reason` / `qc_returned_at` and defaults to `sort=returned_at&direction=desc`.
+- `submitted`: completed capture with current-cycle `qc_reviews.submitted_at`, excluding current rework/final approval. Submission records actor/time independently of claims. Claim release/expiry does not undo handoff; rework requires explicit resubmission after capture/OCR.
+- `completed`: document workflow `approved`, never merely `awaiting_approval_l1`. The current schema has no final-approved state, so this view is empty; no approval decision or transition is added here.
+
+Rows expose `workflow_status`, the current review's `qc_reviewer` and `qc_claim_live`. `sort=workflow_status` orders the stage column; an expired claim is not labelled as active QC. Filtered totals and independent per-view badge `counts` use the same predicates and authorized nondeleted scope in a read-only snapshot. `returned` remains an alias of `counts.rework`. Unfiltered status and the existing cancelled filter retain their API behavior. Ordinary operators see only current assignments; oversight remains permission-scoped. Resuming rework preserves its return date; resubmission removes current return indicators and returns it to tracking. Capture status, actor history, QC snapshots and mutation permissions are unchanged.
 
 No approval/archive API is implemented, and archive-role permission names do not grant access to the current operator/QC image routes.
 
@@ -168,9 +184,9 @@ No approval/archive API is implemented, and archive-role permission names do not
 | `pagination` | Controlled Ant Design pagination props, including `current`, `pageSize`, `total` and `onChange` |
 | `scroll`     | Horizontal table configuration; the component measures and owns its vertical scroll area        |
 
-`ColumnHeading`, `BatchIdentity` and `BatchIdHeading` share heading/copy behavior. `BatchIdentity` can show caller-provided text or only its info/copy icon. The shared component must not fetch data, grant permissions or invent approval actions. Callers own query state, columns, version checks and confirmations.
+`ColumnHeading`, `BatchIdentity` and `BatchIdHeading` share heading/copy behavior. `BatchIdentity` is icon-only across QC, operator, administrator batch tables and the OCR list: hover to view the code, click to copy. The shared component must not fetch data, grant permissions or invent approval actions. Callers own query state, columns, version checks and confirmations.
 
-Future role queues should reuse that table, `PageViewer`, `IconButton`, the compact theme and the existing shell. Read-only viewing must be a real permission mode, not an editable QC screen with buttons merely hidden. Existing OCR/admin tables have not all been migrated to `WorklistTable`; the shared height hook is reused there.
+Future role queues should reuse that table, `PageViewer`, `IconButton`, the compact theme and the existing shell. Read-only viewing must be a real permission mode, not an editable QC screen with buttons merely hidden. The OCR job list now uses `WorklistTable`; its narrow detail-page rail and other administrative tables retain their existing tables/height hook.
 
 ### URL-backed state currently implemented
 
@@ -178,9 +194,12 @@ Future role queues should reuse that table, `PageViewer`, `IconButton`, the comp
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | QC queue                   | `tab`, `status`, `q`, `metadata`, `ocr`, `sort`, `direction`, `page`, `size`                                                                                             |
 | Operator/admin batch lists | `status`, `q`, `sort`, `direction`, `page`, `size`, `activity`                                                                                                           |
+| OCR job list               | `status`, `q`, `sort`, `direction`, `page`, `size`; job details retain the originating list in `returnTo`                                                                |
 | Document inspection        | `tab`, `page`, `rail`, `session`, `excluded`, `original`, `revision`, `zoom`, `pixels`, `fullscreen`, `processing`, `machine`, `policy`, `evidence`, `field`, `returnTo` |
 
 In document URLs, `page` is a UUID and `rail` is the thumbnail-window number. In list URLs, `page` is a one-based page number. Boolean options use `1`/`0`; zoom uses `width`, `page` or a bounded numeric scale. Supported list sizes are 25/50/100. Invalid choices fall back to safe supported values.
+
+`MetadataPanel` also owns the URL-backed `notices` disclosure on both document and OCR-run routes. It defaults to collapsed; toggling replaces history without serializing warning text or modifying saved warnings. The completeness hint remains visible in the counted summary, with completeness details first on expansion.
 
 Explicit navigation pushes browser history; typing and transient preview/disclosure changes replace the entry. `digitalarch:url-state` synchronizes the hook with the existing guarded route navigation. `returnTo` restores a supported originating list. No new router or localStorage authentication was added.
 

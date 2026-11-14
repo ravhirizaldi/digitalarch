@@ -14,6 +14,7 @@ import {
   Menu,
   Modal,
   Popconfirm,
+  Progress,
   Space,
   Spin,
   Tag,
@@ -21,15 +22,17 @@ import {
 import {
   DatabaseOutlined,
   FileTextOutlined,
+  KeyOutlined,
   LogoutOutlined,
   ScanOutlined,
   SettingOutlined,
   TeamOutlined,
+  UserOutlined,
 } from '@ant-design/icons';
 import { enterpriseTheme } from './theme';
 import { api, setCsrfToken } from './api';
 import { matchRoute, permittedRoute, routePath } from './routes';
-import { statusLabels } from './ui';
+import { IconButton, statusLabels } from './ui';
 import ScannerSettings from './ScannerSettings';
 import ScannerWorkspace from './ScannerWorkspace';
 import AuthScreen from './AuthScreen';
@@ -51,6 +54,7 @@ function DigitalArchApp() {
   const [ocrJobId, setOcrJobId] = useState(null);
   const [documentBatchId, setDocumentBatchId] = useState(null);
   const [documentStatus, setDocumentStatus] = useState(null);
+  const [ocrStatus, setOcrStatus] = useState(null);
   const [capturePageId, setCapturePageId] = useState(null);
   const [ocrMetadataDirty, setOcrMetadataDirty] = useState(false);
   const activeId = useRef(null);
@@ -73,6 +77,7 @@ function DigitalArchApp() {
   const scanning = active?.sessions.some((session) => session.status === 'running');
   const locked = active && !['in_progress', 'paused'].includes(active.batch.status);
   const busy = !!working || scanning || scanner.busy || scanner.checking;
+  const ocrFooter = view === 'ocr' && ocrStatus?.jobId === ocrJobId ? ocrStatus : null;
   const partial = active?.sessions.some((session) =>
     ['partial', 'interrupted'].includes(session.status),
   );
@@ -93,8 +98,9 @@ function DigitalArchApp() {
     )
       destination.search = window.location.search;
     else if (
-      next === 'document' &&
-      ['/qc', '/batches', '/capture', '/admin/batches'].includes(window.location.pathname)
+      (next === 'document' &&
+        ['/qc', '/batches', '/capture', '/admin/batches'].includes(window.location.pathname)) ||
+      (next === 'ocr' && batchId && window.location.pathname === '/ocr')
     )
       destination.searchParams.set('returnTo', window.location.pathname + window.location.search);
     else {
@@ -340,11 +346,11 @@ function DigitalArchApp() {
     });
     setRequestedMode(null);
   }
-  const changePage = (page, action) =>
+  const changePage = (page, action, label) =>
     run('page', async () => {
       const result = await api(
         `/api/pages/${page.id}`,
-        { version: active.batch.version, action },
+        { version: active.batch.version, action, ...(action === 'rename' ? { label } : {}) },
         'PATCH',
       );
       if (activeId.current === result.batch.id) setActive(result);
@@ -367,7 +373,10 @@ function DigitalArchApp() {
       : null,
     pageDetails: (active?.pages || []).map((page) => ({
       id: page.id,
-      pageNumber: page.display_order,
+      page_number: page.page_number,
+      page_label: page.page_label,
+      capture_order: page.capture_order,
+      replacement_candidate: page.replacement_candidate,
       rotation: page.rotation_degrees,
       excluded: page.is_excluded,
       sessionId: page.scan_session_id,
@@ -437,6 +446,7 @@ function DigitalArchApp() {
         <div className="header-operational">
           {can('scanner:read') && (
             <Badge
+              className="header-scanner-status"
               status={scanner.canScan ? 'success' : 'warning'}
               text={
                 <span className="header-status">
@@ -445,33 +455,43 @@ function DigitalArchApp() {
               }
             />
           )}
-          <span>{user.display_name}</span>
-          <Button
-            disabled={busy || !!active || ocrMetadataDirty}
-            onClick={() => setChangingPassword(true)}
-          >
-            Change password
-          </Button>
-          <Button
-            icon={<LogoutOutlined aria-hidden />}
-            disabled={busy}
-            onClick={() =>
-              run('logout', async () => {
-                if (ocrMetadataDirty && !window.confirm('Discard unsaved metadata edits?')) return;
-                if (active && !locked)
-                  await api(`/api/batches/${active.batch.id}/pause`, {
-                    version: active.batch.version,
-                  });
-                await api('/api/auth/logout', {});
-                clearBatch();
-                setIdentity(null);
-                setCsrfToken('');
-                window.history.replaceState(null, '', '/');
-              })
-            }
-          >
-            Sign out
-          </Button>
+          <span className="header-user" title={user.display_name}>
+            <UserOutlined className="header-user-avatar" aria-hidden />
+            <span className="header-user-name">{user.display_name}</span>
+          </span>
+          <div className="header-account-actions">
+            <IconButton
+              className="header-account-button"
+              type="text"
+              label="Change password"
+              icon={<KeyOutlined aria-hidden />}
+              disabled={busy || !!active || ocrMetadataDirty}
+              onClick={() => setChangingPassword(true)}
+            />
+            <Button
+              className="header-account-button header-sign-out"
+              type="text"
+              icon={<LogoutOutlined aria-hidden />}
+              disabled={busy}
+              onClick={() =>
+                run('logout', async () => {
+                  if (ocrMetadataDirty && !window.confirm('Discard unsaved metadata edits?'))
+                    return;
+                  if (active && !locked)
+                    await api(`/api/batches/${active.batch.id}/pause`, {
+                      version: active.batch.version,
+                    });
+                  await api('/api/auth/logout', {});
+                  clearBatch();
+                  setIdentity(null);
+                  setCsrfToken('');
+                  window.history.replaceState(null, '', '/');
+                })
+              }
+            >
+              Sign out
+            </Button>
+          </div>
         </div>
       </Layout.Header>
       {!!items.length && (
@@ -524,6 +544,7 @@ function DigitalArchApp() {
                     busy={busy}
                     requesting={working}
                     networkError=""
+                    pageError={error}
                     scenario={scenario}
                     setScenario={setScenario}
                     pageDelay={pageDelay}
@@ -536,9 +557,16 @@ function DigitalArchApp() {
                 <>
                   <div className="workspace-toolbar batch-context">
                     <div>
-                      <h1>
-                        Active batch · {active.batch.batch_code}
-                        {latest ? ` (Session ${latest.session_number})` : ''}
+                      <h1 className="batch-context-identity">
+                        <Tag icon={<DatabaseOutlined aria-hidden />}>{active.batch.batch_code}</Tag>
+                        {latest && (
+                          <Tag
+                            icon={<ScanOutlined aria-hidden />}
+                            aria-label="Current scan session"
+                          >
+                            Session {latest.session_number}
+                          </Tag>
+                        )}
                       </h1>
                       {active.batch.physical_location && (
                         <span className="muted">{active.batch.physical_location}</span>
@@ -546,7 +574,11 @@ function DigitalArchApp() {
                     </div>
                     <span className="toolbar-spacer" />
                     <Button disabled={busy} onClick={() => leave('document', active.batch.id)}>
-                      Document / Metadata / QC
+                      {['capturing', 'operator_preparation', 'rework'].includes(
+                        active.batch.workflow_status,
+                      )
+                        ? 'Prepare document'
+                        : 'View document'}
                     </Button>
                     {locked ? (
                       <Tag color="success">Capture completed · Read-only</Tag>
@@ -591,9 +623,7 @@ function DigitalArchApp() {
                           setComplete(true);
                         }}
                       >
-                        {active.batch.workflow_status === 'rework'
-                          ? 'Resubmit to QC'
-                          : 'Complete Capture'}
+                        Complete Capture
                       </Button>
                     )}
                   </div>
@@ -604,6 +634,7 @@ function DigitalArchApp() {
                     busy={busy}
                     requesting={working}
                     networkError=""
+                    pageError={error}
                     scenario={scenario}
                     setScenario={setScenario}
                     pageDelay={pageDelay}
@@ -637,6 +668,7 @@ function DigitalArchApp() {
                 onOpen={(id) => showView('ocr', id)}
                 onSettings={() => navigate('settings')}
                 onOpenDocument={(id) => showView('document', id)}
+                onStatusChange={setOcrStatus}
               />
             ) : view === 'qc' ? (
               <QcQueue onOpen={(id) => showView('document', id)} />
@@ -674,16 +706,27 @@ function DigitalArchApp() {
           </Suspense>
         </div>
       </Layout.Content>
-      <footer className="status-bar">
-        <span>
+      <footer className={`status-bar${ocrFooter ? ' status-bar-ocr' : ''}`}>
+        <span title={ocrFooter?.text}>
           {view === 'document'
             ? documentStatus?.batchId === documentBatchId
               ? documentStatus.text
               : 'Document review'
-            : active
-              ? active.batch.batch_code
-              : 'No active batch'}
+            : view === 'ocr' && ocrJobId
+              ? ocrFooter?.text || 'OCR job'
+              : active
+                ? active.batch.batch_code
+                : 'No active batch'}
         </span>
+        {ocrFooter && (
+          <Progress
+            className="ocr-footer-progress"
+            aria-label="OCR job progress"
+            percent={ocrFooter.percent}
+            size="small"
+            status={ocrFooter.status === 'completed_with_errors' ? 'exception' : 'normal'}
+          />
+        )}
         <span>Asia/Jakarta · WIB</span>
       </footer>
       <ScannerSettings
@@ -762,15 +805,19 @@ function DigitalArchApp() {
               version: active.batch.version,
               acknowledgePartial: acknowledge,
             });
+            const batchId = active.batch.id;
             clearBatch();
-            showView('home');
+            showView('document', batchId);
           })
         }
       >
         <p>
           {active?.batch.page_count} captured pages in {active?.batch.session_count} sessions.
         </p>
-        <p>This locks capture for this batch. It does not complete QC or send it for approval.</p>
+        <p>
+          Capture will close and OCR will run. You can then edit metadata or page labels, or skip
+          editing and Send to QC. Completing capture does not send it to QC.
+        </p>
         {partial && (
           <Checkbox
             checked={acknowledge}
@@ -792,7 +839,10 @@ createRoot(document.getElementById('root')).render(
     csp={{ nonce }}
     wave={{ disabled: true }}
   >
-    <AntApp className="ant-app-root">
+    <AntApp
+      className="ant-app-root"
+      notification={{ placement: 'bottomRight', bottom: 36, stack: { threshold: 2 } }}
+    >
       <DigitalArchApp />
     </AntApp>
   </ConfigProvider>,

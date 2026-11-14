@@ -109,7 +109,7 @@ try {
     const d = good(await op.request(`/api/batches/${batch.id}`));
     return d.sessions.every((s) => s.status !== 'running');
   });
-  await p.getByRole('button', { name: 'Document / Metadata / QC', exact: true }).click();
+  await p.getByRole('button', { name: 'Prepare document', exact: true }).click();
   await p
     .getByRole('button', { name: 'Add field', exact: true })
     .waitFor()
@@ -139,10 +139,57 @@ try {
       good(await op.request(`/api/batches/${batch.id}`)).batch.status === 'capture_completed',
   );
   await drain();
+  await p.goto(`${f.origin}/batches?status=capture_completed`);
+  await p.getByRole('button', { name: 'View details', exact: true }).waitFor();
+  assert.equal(good(await qc.request('/api/qc/queue?filter=all')).total, 0);
+  await p.getByRole('button', { name: 'Prepare document', exact: true }).click();
+  const preparationNotice = p
+    .locator('.document-workflow-notification')
+    .filter({ hasText: 'Not sent to QC' });
+  await preparationNotice.waitFor();
+  assert.equal(await p.locator('.qc-workspace > .ant-alert').count(), 0);
+  assert.equal(
+    (await p.getByRole('button', { name: 'Send to QC', exact: true }).textContent()).trim(),
+    'Send to QC',
+  );
+  await preparationNotice.getByRole('button', { name: 'Close', exact: true }).click();
+  for (let i = 0; i < 2; i++)
+    await p.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `/api/qc/${batch.id}` &&
+        response.request().method() === 'GET',
+    );
+  assert.equal(
+    await preparationNotice.count(),
+    0,
+    'Polling must not reopen a dismissed workflow notification',
+  );
+  await p.getByRole('button', { name: 'Send to QC', exact: true }).click();
+  await p
+    .locator('.ant-popconfirm')
+    .getByRole('button', { name: 'Send to QC', exact: true })
+    .click();
+  await until(async () => good(await op.request('/api/batches?status=submitted')).total === 1);
+  await p.goto(`${f.origin}/batches?status=capture_completed`);
   await q.goto(`${f.origin}/qc`);
   await q.getByRole('button', { name: 'Open', exact: true }).first().click();
   await q.getByRole('button', { name: 'Claim document', exact: true }).click();
   await q.getByRole('button', { name: 'Pass QC', exact: true }).waitFor();
+  await p.reload();
+  await p
+    .getByRole('tab', { name: /^Capture Completed/ })
+    .locator('.ant-badge-count[title="0"]')
+    .waitFor();
+  assert.equal(await p.getByRole('button', { name: 'View details', exact: true }).count(), 0);
+  await p.getByRole('tab', { name: /^Submitted \/ Tracking/ }).click();
+  await p.getByText(`QC — ${qc.user.display_name}`, { exact: true }).waitFor();
+  assert.equal(new URL(p.url()).searchParams.get('status'), 'submitted');
+  assert.equal(await p.getByRole('button', { name: 'Delete batch', exact: true }).count(), 0);
+  assert.equal(await p.getByRole('button', { name: 'Resume', exact: true }).count(), 0);
+  await p.reload();
+  await p.getByRole('button', { name: 'View document', exact: true }).waitFor();
+  await p.getByRole('tab', { name: /^Completed history/ }).click();
+  await p.getByText(/No final-approved batches/).waitFor();
   assert.equal(
     await q.getByLabel('Field 1 value', { exact: true }).inputValue(),
     'Human browser title',
@@ -169,6 +216,15 @@ try {
       good(await qc.request(`/api/qc/${batch.id}`)).document.workflow_status ===
       'awaiting_approval_l1',
   );
+  await p.goto(`${f.origin}/batches?status=submitted`);
+  await q.getByRole('tab', { name: 'History', exact: true }).click();
+  const historyRow = q.locator('.qc-history-list > li').first();
+  assert.equal(await historyRow.evaluate((row) => getComputedStyle(row).paddingBottom), '6px');
+  assert.ok(
+    await q.locator('.qc-history-heading time').count(),
+    'Compact activity rows retain timestamps',
+  );
+  await p.getByText('Awaiting L1', { exact: true }).waitFor();
   console.log(
     'A/D: ten-page normal capture, pre-OCR human metadata preservation, claim, verification and pass through browser controls.',
   );
@@ -196,6 +252,8 @@ try {
     }),
   );
   await drain();
+  capture = good(await op.request(`/api/batches/${multiId}`));
+  good(await op.request(`/api/batches/${multiId}/submit-qc`, { version: capture.batch.version }));
   await q.goto(`${f.origin}/documents/${multiId}`);
   await q.getByRole('button', { name: 'Claim document', exact: true }).click();
   await q.getByRole('button', { name: 'Pass QC', exact: true }).waitFor();
@@ -235,7 +293,25 @@ try {
   await until(
     async () => good(await op.request(`/api/qc/${multiId}`)).document.workflow_status === 'rework',
   );
-  await p.goto(`${f.origin}/documents/${multiId}`);
+  await p.goto(`${f.origin}/batches?status=rework`);
+  await p.getByRole('tab', { name: /^Returned from QC/ }).waitFor();
+  await p
+    .getByRole('tab', { name: /^Returned from QC/ })
+    .locator('.ant-badge-count[title="1"]')
+    .waitFor();
+  const returnedDate = p.getByRole('columnheader', { name: /Returned at/ });
+  await returnedDate.waitFor();
+  assert.equal(await returnedDate.getAttribute('aria-sort'), 'descending');
+  assert.equal(await p.getByRole('columnheader', { name: /Status|Created|Activity/ }).count(), 0);
+  const returnReason = p.getByRole('button', { name: 'QC return reason', exact: true });
+  await returnReason.focus();
+  await p
+    .getByRole('tooltip')
+    .filter({ hasText: 'Replace page 45 and insert after page 78.' })
+    .waitFor();
+  assert.equal(await p.getByRole('button', { name: 'QC findings', exact: true }).count(), 0);
+  await p.getByRole('button', { name: 'Continue rework', exact: true }).click();
+  await p.getByRole('button', { name: 'Prepare document', exact: true }).click();
   await p.getByRole('button', { name: 'View findings', exact: true }).click();
   await p.getByText('Page 45 is blurry', { exact: true }).waitFor();
   await p.getByRole('button', { name: 'Page 45', exact: true }).click();
@@ -274,8 +350,14 @@ try {
     const c = good(await op.request(`/api/batches/${multiId}`));
     return c.sessions.every((s) => s.status !== 'running') ? c : null;
   });
-  good(await op.request(`/api/batches/${multiId}/resubmit-qc`, { version: capture.batch.version }));
+  good(
+    await op.request(`/api/batches/${multiId}/complete-capture`, {
+      version: capture.batch.version,
+    }),
+  );
   await drain();
+  capture = good(await op.request(`/api/batches/${multiId}`));
+  good(await op.request(`/api/batches/${multiId}/resubmit-qc`, { version: capture.batch.version }));
   await q2.goto(`${f.origin}/documents/${multiId}`);
   await q2.getByRole('button', { name: 'Claim document', exact: true }).click();
   await q2.getByRole('button', { name: 'Pass QC', exact: true }).waitFor();

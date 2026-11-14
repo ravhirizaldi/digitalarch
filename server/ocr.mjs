@@ -7,11 +7,12 @@ import { ocrProvider } from './ocr-engines.mjs';
 import { ocrDefaults } from './ocr-defaults.mjs';
 import { processingConfig } from './ocr-profiles.mjs';
 import { documentMetadata } from './document-metadata.mjs';
-import { documentFor } from './workflow.mjs';
+import { documentFor, submittedBatch, requireSubmission } from './workflow.mjs';
 
-const jobSelect = `SELECT j.*,b.batch_code,b.assigned_operator_id,
+const jobSelect = `SELECT j.*,b.batch_code,b.physical_location,b.assigned_operator_id,
+   (SELECT workflow_status FROM documents WHERE batch_id=b.id ORDER BY document_index LIMIT 1) AS workflow_status,
   (SELECT count(*)::int FROM scan_sessions s WHERE s.batch_id=j.batch_id) AS session_count,
-  (SELECT p.capture_order FROM page_ocr_results r JOIN pages p ON p.id=r.page_id WHERE r.ocr_job_id=j.id AND r.status='processing' LIMIT 1) AS current_page
+  (SELECT p.page_number FROM page_ocr_results r JOIN document_pages p ON p.id=r.page_id WHERE p.batch_id=j.batch_id AND r.ocr_job_id=j.id AND r.status='processing' LIMIT 1) AS current_page
   FROM ocr_jobs j JOIN archive_batches b ON b.id=j.batch_id`;
 const publicJob = (job) =>
   Object.fromEntries(
@@ -47,7 +48,11 @@ export function ocrProcessing(pool, storage, options = {}) {
           source.batch_id,
         ]);
         const doc = await documentFor(client, source.batch_id, true);
-        if (['qc_in_review', 'awaiting_approval_l1'].includes(doc?.workflow_status))
+        if (
+          ['preparing', 'qc_waiting', 'qc_in_review', 'awaiting_approval_l1'].includes(
+            doc?.workflow_status,
+          )
+        )
           throw failure(
             'document_locked',
             'OCR history is locked during or after QC. Use the QC workspace.',
@@ -62,6 +67,10 @@ export function ocrProcessing(pool, storage, options = {}) {
       )
     ).rows[0];
     if (!job) throw failure('not_found', 'OCR job not found.', 404);
+    await requireSubmission(client, user, {
+      id: job.batch_id,
+      assigned_operator_id: job.assigned_operator_id,
+    });
     if (
       job.assigned_operator_id !== user.id &&
       !user.permissions.includes(manage ? 'ocr:manage_all' : 'ocr:read_all')
@@ -442,36 +451,60 @@ export function ocrProcessing(pool, storage, options = {}) {
       while (ticking) await new Promise((resolve) => setTimeout(resolve, 10));
       await Promise.allSettled([...tasks]);
     },
-    async list(user, { limit, offset, status = '' }) {
+    async list(
+      user,
+      { limit, offset, status = '', search = '', sort = 'created_at', direction = 'desc' },
+    ) {
       requirePermission(user, 'ocr:read');
       if (status && !['queued', 'running', 'paused', ...terminal].includes(status))
         throw failure('invalid_status', 'Invalid OCR status.');
+      const columns = {
+        batch_code: 'b.batch_code',
+        physical_location: 'b.physical_location',
+        total_pages: 'j.total_pages',
+        processed_pages: 'j.processed_pages',
+        failed_pages: 'j.failed_pages',
+        progress: '(j.processed_pages+j.failed_pages)::numeric/NULLIF(j.total_pages,0)',
+        status: 'j.status',
+        created_at: 'j.created_at',
+      };
+      if (!Object.hasOwn(columns, sort) || !['asc', 'desc'].includes(direction))
+        throw failure('invalid_request', 'Invalid OCR sort.');
       const all = user.permissions.includes('ocr:read_all');
-      const where = 'WHERE b.deleted_at IS NULL AND ($1::boolean OR b.assigned_operator_id=$2)';
-      const args = [all, user.id];
-      const overview = (
-        await pool.query(
-          `SELECT count(*)::int AS total,
+      const scope = `WHERE b.deleted_at IS NULL AND ($1::boolean OR b.assigned_operator_id=$2)
+        ${user.permissions.includes('batches:reassign') ? '' : `AND (b.assigned_operator_id=$2 OR ${submittedBatch})`}`;
+      const where = `${scope} AND ($3='' OR j.status=$3)
+        AND ($4='' OR strpos(lower(b.batch_code),lower($4))>0
+          OR strpos(lower(coalesce(b.physical_location,'')),lower($4))>0)`;
+      const args = [all, user.id, status, search];
+      return transaction(pool, async (client) => {
+        await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+        const overview = (
+          await client.query(
+            `SELECT count(*)::int AS total,
         count(*) FILTER(WHERE j.status='queued')::int AS queued,count(*) FILTER(WHERE j.status='running')::int AS running,
         count(*) FILTER(WHERE j.status='completed')::int AS completed,
         count(*) FILTER(WHERE j.status='failed' OR j.failed_pages>0)::int AS errors
-        FROM ocr_jobs j JOIN archive_batches b ON b.id=j.batch_id ${where}`,
-          args,
-        )
-      ).rows[0];
-      const jobs = (
-        await pool.query(
-          `${jobSelect} ${where} AND ($3='' OR j.status=$3) ORDER BY j.created_at DESC,j.id LIMIT $4 OFFSET $5`,
-          [...args, status, limit, offset],
-        )
-      ).rows.map(publicJob);
-      const total = (
-        await pool.query(
-          `SELECT count(*)::int AS total FROM ocr_jobs j JOIN archive_batches b ON b.id=j.batch_id ${where} AND ($3='' OR j.status=$3)`,
-          [...args, status],
-        )
-      ).rows[0].total;
-      return { jobs, total, overview };
+        FROM ocr_jobs j JOIN archive_batches b ON b.id=j.batch_id ${scope}`,
+            [all, user.id],
+          )
+        ).rows[0];
+        const jobs = (
+          await client.query(
+            `${jobSelect} ${where} ORDER BY ${columns[sort]} ${direction} NULLS LAST,j.id LIMIT $5 OFFSET $6`,
+            [...args, limit, offset],
+          )
+        ).rows.map(publicJob);
+        const totals = (
+          await client.query(
+            `SELECT count(*)::int AS total,coalesce(sum(j.total_pages),0)::int AS pages,
+            coalesce(sum(j.processed_pages),0)::int AS processed,coalesce(sum(j.failed_pages),0)::int AS failed
+            FROM ocr_jobs j JOIN archive_batches b ON b.id=j.batch_id ${where}`,
+            args,
+          )
+        ).rows[0];
+        return { jobs, ...totals, overview };
+      });
     },
     async enqueue(user, batchId, body) {
       uuid(batchId);
@@ -488,7 +521,11 @@ export function ocrProcessing(pool, storage, options = {}) {
         if (batch.status !== 'capture_completed')
           throw failure('batch_locked', 'Complete capture before sending the batch to OCR.', 409);
         const doc = await documentFor(client, batchId, true);
-        if (['qc_in_review', 'awaiting_approval_l1'].includes(doc?.workflow_status))
+        if (
+          ['preparing', 'qc_waiting', 'qc_in_review', 'awaiting_approval_l1'].includes(
+            doc?.workflow_status,
+          )
+        )
           throw failure(
             'document_locked',
             'OCR is controlled by the QC workspace during or after review.',
@@ -578,14 +615,14 @@ export function ocrProcessing(pool, storage, options = {}) {
       return this.get(user, next);
     },
     async pages(user, id, { limit, offset }) {
-      await authorize(user, id);
+      const job = await authorize(user, id);
       const pages = (
         await pool.query(
-          `SELECT r.*,p.capture_order AS page_number,s.session_number,p.width_px,p.height_px,
+          `SELECT r.*,p.page_number,p.page_label,p.capture_order,p.is_excluded,p.replacement_candidate,s.session_number,p.width_px,p.height_px,
         coalesce(r.extracted_text,c.extracted_text) AS extracted_text,coalesce(r.structured_result,c.structured_result) AS structured_result
-        FROM page_ocr_results r JOIN pages p ON p.id=r.page_id JOIN scan_sessions s ON s.id=p.scan_session_id
-        LEFT JOIN page_ocr_results c ON c.id=r.reused_result_id WHERE r.ocr_job_id=$1 ORDER BY p.capture_order LIMIT $2 OFFSET $3`,
-          [id, limit, offset],
+        FROM page_ocr_results r JOIN document_pages p ON p.id=r.page_id JOIN scan_sessions s ON s.id=p.scan_session_id
+        LEFT JOIN page_ocr_results c ON c.id=r.reused_result_id WHERE r.ocr_job_id=$1 AND p.batch_id=$4 ORDER BY p.capture_order LIMIT $2 OFFSET $3`,
+          [id, limit, offset, job.batch_id],
         )
       ).rows.map(publicPage);
       return { pages };
@@ -602,6 +639,10 @@ export function ocrProcessing(pool, storage, options = {}) {
       if (!page) throw failure('not_found', 'Page not found.', 404);
       if (page.assigned_operator_id !== user.id && !user.permissions.includes('ocr:read_all'))
         throw failure('forbidden', 'This page belongs to another operator.', 403);
+      await requireSubmission(pool, user, {
+        id: page.batch_id,
+        assigned_operator_id: page.assigned_operator_id,
+      });
       await storage.ocrImage({
         storage_key: page.active_storage_key,
         image_sha256: page.active_image_sha256,

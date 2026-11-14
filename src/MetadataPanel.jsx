@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Alert, Button, Empty, Input, Popconfirm, Select, Space, Spin, Tag } from 'antd';
-import { DeleteOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, PlusOutlined, ReloadOutlined, WarningOutlined } from '@ant-design/icons';
 import { api } from './api';
 import { dateTime, IconButton } from './ui';
+import { useUrlState } from './useUrlState';
+
+const readNoticeState = (params) => ({ notices: params.get('notices') === '1' });
 
 export const metadataTypeLabels = {
   title: 'Title',
@@ -36,10 +39,11 @@ export default function MetadataPanel({
   metadataPath,
   canVerify = false,
   onSaved,
-  pageNumbers = {},
+  pageNames = {},
   expandedEvidence,
   onEvidenceToggle,
   focusedField,
+  refreshVersion,
 }) {
   const base = metadataPath || `/api/ocr/jobs/${job.id}/metadata`;
   const [data, setData] = useState(null);
@@ -48,6 +52,7 @@ export default function MetadataPanel({
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState('');
   const [error, setError] = useState('');
+  const [{ notices }, setNoticeState] = useUrlState(readNoticeState);
   const accept = useCallback((metadata) => {
     setData(metadata);
     setFields(metadata.fields);
@@ -65,6 +70,7 @@ export default function MetadataPanel({
     }
   }, [base, accept]);
   useEffect(() => {
+    if (dirty) return;
     let alive = true;
     api(base)
       .then(({ metadata }) => {
@@ -79,7 +85,7 @@ export default function MetadataPanel({
     return () => {
       alive = false;
     };
-  }, [base, accept]);
+  }, [base, accept, refreshVersion, dirty]);
   useEffect(() => {
     onDirtyChange(dirty);
     const warn = (event) => {
@@ -143,6 +149,11 @@ export default function MetadataPanel({
     }
   }
   const finished = !['queued', 'running', 'paused'].includes(job.status);
+  const warnings = data?.warnings || [];
+  const completeness = warnings.find((warning) => /completeness|more pages than/i.test(warning));
+  const orderedWarnings = completeness
+    ? [completeness, ...warnings.filter((warning) => warning !== completeness)]
+    : warnings;
   const reloadButton = (
     <IconButton
       label="Reload metadata"
@@ -213,18 +224,35 @@ export default function MetadataPanel({
           <Spin />
         ) : (
           <>
-            <p className="metadata-intro">
-              Review suggested values against the source pages before verifying.
-            </p>
             {!finished && (
               <Alert
                 type="info"
                 title="Extraction is available when this OCR run finishes or is cancelled."
               />
             )}
-            {data?.warnings.map((warning) => (
-              <Alert key={warning} type="warning" showIcon title={warning} />
-            ))}
+            {!!warnings.length && (
+              <details
+                className="metadata-notices"
+                open={notices}
+                onToggle={(event) => {
+                  if (event.currentTarget.open !== notices)
+                    setNoticeState({ notices: event.currentTarget.open }, { replace: true });
+                }}
+              >
+                <summary>
+                  <WarningOutlined aria-hidden />{' '}
+                  <strong>
+                    {warnings.length} review {warnings.length === 1 ? 'notice' : 'notices'}
+                  </strong>
+                  {completeness && <span> · Check completeness</span>}
+                </summary>
+                <ul>
+                  {orderedWarnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
             {data?.updatedAt && (
               <p className="metadata-save-state" role="status">
                 Saved {dateTime(data.updatedAt)}
@@ -393,7 +421,7 @@ export default function MetadataPanel({
                     {field.source.map((source, i) => (
                       <div key={`${source.resultId}-${source.index}-${i}`}>
                         <Button type="link" size="small" onClick={() => onSource(source)}>
-                          Page {pageNumbers[source.pageId] ?? source.pageNumber}
+                          {pageNames[source.pageId] ?? `Page ${source.pageNumber}`}
                         </Button>
                         <span>{source.text}</span>
                       </div>

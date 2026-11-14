@@ -167,11 +167,88 @@ test('OCR processing: one page per claim, immediate persistence, immutable files
     { code: '23505' },
   );
   assert.equal((await f.operator.request('/api/ocr/jobs')).body.overview.completed, 1);
+  const totals = (await f.operator.request('/api/ocr/jobs?status=completed')).body;
+  assert.equal(totals.pages, 3);
+  assert.equal(totals.processed, 3);
+  assert.equal(totals.failed, 0);
   const source = `/api/ocr/jobs/${job.id}/pages/${captured.pages[0].id}/image`;
   const original = await f.operator.request(source);
   assert.equal(original.status, 200);
   assert.deepEqual(Buffer.from(await original.response.arrayBuffer()), bytes);
   assert.equal((await (await f.account()).request(source)).status, 403);
+});
+
+test('OCR list: server sorting, literal search, filtered totals and private overview', async (t) => {
+  const f = await fixture(t);
+  const first = await f.create();
+  const second = await f.create('single');
+  await f.pool.query('UPDATE archive_batches SET physical_location=$2 WHERE id=$1', [
+    first.batch.id,
+    'Rack A',
+  ]);
+  await f.pool.query('UPDATE archive_batches SET physical_location=$2 WHERE id=$1', [
+    second.batch.id,
+    'Rack Z %_',
+  ]);
+  assert.equal((await f.control(first.job.id, 'pause')).status, 200);
+  const list = async (query = '', account = f.operator) => {
+    const response = await account.request(`/api/ocr/jobs?${query}`);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    return response.body;
+  };
+  const sorted = await list('sort=physical_location&direction=asc&limit=1');
+  assert.equal(sorted.total, 2);
+  assert.equal(sorted.pages, 4);
+  assert.equal(sorted.processed, 0);
+  assert.equal(sorted.failed, 0);
+  assert.equal(sorted.jobs.length, 1);
+  assert.equal(sorted.jobs[0].id, first.job.id);
+  assert.equal(sorted.jobs[0].physical_location, 'Rack A');
+  assert.equal(
+    (await list('sort=physical_location&direction=asc&limit=1&offset=1')).jobs[0].id,
+    second.job.id,
+  );
+  assert.deepEqual(
+    (await list('sort=total_pages&direction=asc')).jobs.map((job) => job.id),
+    [second.job.id, first.job.id],
+  );
+  const filtered = await list('status=paused&search=rAcK');
+  assert.equal(filtered.total, 1);
+  assert.equal(filtered.pages, 3);
+  assert.equal(filtered.jobs[0].id, first.job.id);
+  assert.equal(filtered.overview.total, 2, 'Overview is independent of search/status/paging');
+  assert.equal(
+    (await list(new URLSearchParams({ search: '%_' }))).total,
+    1,
+    'Search metacharacters are literal',
+  );
+  assert.equal((await list(new URLSearchParams({ search: first.batch.batch_code }))).total, 1);
+  const empty = await list('search=no-such-batch');
+  assert.equal(empty.total, 0);
+  assert.equal(empty.pages, 0);
+  assert.equal(empty.processed, 0);
+  assert.equal(empty.failed, 0);
+  const privateList = await list('', await f.account());
+  assert.equal(privateList.total, 0);
+  assert.equal(privateList.pages, 0);
+  assert.equal(privateList.overview.total, 0);
+  assert.deepEqual(privateList.jobs, []);
+  assert.equal((await list('', f.admin)).total, 2);
+  for (const sort of [
+    'batch_code',
+    'processed_pages',
+    'failed_pages',
+    'progress',
+    'status',
+    'created_at',
+  ])
+    await list(new URLSearchParams({ sort, direction: 'desc' }));
+  for (const query of [
+    'sort=created_at%3BDROP%20TABLE%20ocr_jobs',
+    'direction=sideways',
+    new URLSearchParams({ search: 'x'.repeat(241) }),
+  ])
+    assert.equal((await f.operator.request(`/api/ocr/jobs?${query}`)).status, 400);
 });
 
 test('OCR backfill: explicitly queue pre-feature completed captures, idempotently and without reopening capture', async (t) => {
@@ -589,7 +666,7 @@ test('OCR security: authentication, ownership, admin permissions, CSRF, validati
   assert.equal((await fetch(f.origin + url)).status, 401);
   for (const route of [url, `${url}/pages`, `/api/pages/${captured.pages[0].id}/ocr`]) {
     assert.equal((await other.request(route)).status, 403);
-    assert.equal((await qc.request(route)).status, 200);
+    assert.equal((await qc.request(route)).status, 403);
     assert.equal((await f.admin.request(route)).status, 200);
   }
   assert.equal((await other.request('/api/ocr/jobs')).body.total, 0);

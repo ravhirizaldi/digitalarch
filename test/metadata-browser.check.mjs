@@ -42,6 +42,15 @@ try {
     assert.ok(i < 19, 'Synthetic queue drains');
   }
   await f.app.qc.refresh();
+  const reviewNotices = [
+    'Similar spellings were grouped as alternatives. Check each against the source.',
+    'Printed pagination suggests more pages than the completed OCR pages in this run. Check document completeness.',
+    'Different personal names require role verification.',
+  ];
+  await f.pool.query(
+    "UPDATE documents SET metadata_json=jsonb_set(metadata_json,'{warnings}',$2::jsonb) WHERE batch_id=$1",
+    [batch.id, JSON.stringify(reviewNotices)],
+  );
   const jobId = (await f.pool.query('SELECT id FROM ocr_jobs WHERE batch_id=$1', [batch.id]))
     .rows[0].id;
   let executablePath = process.env.CHROMIUM_EXECUTABLE;
@@ -78,10 +87,86 @@ try {
   page.setDefaultTimeout(10000);
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  await page.goto(`${f.origin}/ocr/jobs/${jobId}`);
+  const listQuery = new URLSearchParams({
+    q: batch.batch_code,
+    sort: 'total_pages',
+    direction: 'asc',
+    size: '50',
+    page: '1',
+  });
+  await page.goto(`${f.origin}/ocr?${listQuery}`);
+  await page.getByRole('button', { name: 'Open OCR job', exact: true }).waitFor();
+  assert.equal(
+    await page.getByLabel('Search OCR jobs', { exact: true }).inputValue(),
+    batch.batch_code,
+  );
+  assert.equal(
+    await page.getByRole('columnheader', { name: /Pages/ }).getAttribute('aria-sort'),
+    'ascending',
+  );
+  assert.match(
+    await page.getByRole('status', { name: 'Filtered table totals', exact: true }).innerText(),
+    /1\s*jobs/,
+  );
+  await page.getByRole('button', { name: 'Open OCR job', exact: true }).click();
+  assert.equal(new URL(page.url()).pathname, `/ocr/jobs/${jobId}`);
+  assert.equal(new URL(page.url()).searchParams.get('returnTo'), `/ocr?${listQuery}`);
+  await page.getByRole('progressbar', { name: 'OCR job progress', exact: true }).waitFor();
+  assert.match(
+    await page.locator('.status-bar').innerText(),
+    /3 \/ 3 processed · 0 failed · 1 scan session/,
+  );
+  assert.equal(await page.locator('.ocr-progress-strip').count(), 0);
+  await page.getByRole('button', { name: 'All jobs', exact: true }).click();
+  await page.getByRole('button', { name: 'Open OCR job', exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole('progressbar', { name: 'OCR job progress', exact: true }).count(),
+    0,
+  );
+  assert.equal(new URL(page.url()).searchParams.get('q'), batch.batch_code);
+  assert.equal(new URL(page.url()).searchParams.get('size'), '50');
+  await page.reload();
+  await page.getByRole('button', { name: 'Open OCR job', exact: true }).waitFor();
+  assert.equal(
+    await page.getByLabel('Search OCR jobs', { exact: true }).inputValue(),
+    batch.batch_code,
+  );
+  assert.equal(
+    await page.getByRole('columnheader', { name: /Pages/ }).getAttribute('aria-sort'),
+    'ascending',
+  );
+  await page.getByRole('button', { name: 'Open OCR job', exact: true }).click();
   await page.getByRole('tab', { name: 'Recognized text', exact: true }).waitFor();
+  const pageRail = page.locator('.ocr-inspection-body > .registry-table-region');
+  assert.equal(
+    await pageRail.getByRole('columnheader', { name: 'Status', exact: true }).count(),
+    0,
+  );
+  await pageRail
+    .locator('.ocr-page-list-item')
+    .first()
+    .getByText('Completed', { exact: true })
+    .waitFor();
+  assert.equal(
+    await pageRail
+      .getByRole('columnheader', { name: 'Page', exact: true })
+      .evaluate((element) => element.getBoundingClientRect().height < 60),
+    true,
+    'Page rail header must not wrap vertically',
+  );
+  assert.equal(
+    await pageRail.evaluate((element) => element.scrollWidth <= element.clientWidth),
+    true,
+    'Page rail must fit its available width',
+  );
   assert.equal(await page.getByLabel('Extracted text', { exact: true }).isVisible(), true);
+  await page.getByRole('tab', { name: 'Job details', exact: true }).click();
+  await page.locator('.ocr-job-details').getByText('Engine', { exact: true }).waitFor();
+  assert.equal(await page.getByLabel('Extracted text', { exact: true }).isVisible(), false);
+  assert.equal(await page.locator('.workspace > .ant-collapse').count(), 0);
+  assert.match(await page.locator('.ocr-job-details').innerText(), /test-engine|fixture/);
   await page.getByRole('tab', { name: 'Run metadata history', exact: true }).click();
+  assert.equal(await page.locator('.ocr-job-details').isVisible(), false);
   assert.equal(
     await page.getByRole('button', { name: 'Extract all pages', exact: true }).count(),
     0,
@@ -102,10 +187,56 @@ try {
     false,
     'Recognized text must be hidden on Metadata tab',
   );
-  await page.getByRole('button', { name: 'Document metadata / QC', exact: true }).click();
+  const openDocument = page.getByRole('button', { name: 'Open document', exact: true });
+  assert.equal(
+    await openDocument.evaluate((button) => button.classList.contains('ant-btn-primary')),
+    true,
+  );
+  assert.equal(
+    await openDocument.evaluate(
+      (button) =>
+        !!(
+          button
+            .closest('.workspace-toolbar')
+            .querySelector('.toolbar-spacer')
+            .compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING
+        ),
+    ),
+    true,
+  );
+  await openDocument.click();
   await page.getByLabel('Field 1 value', { exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole('progressbar', { name: 'OCR job progress', exact: true }).count(),
+    0,
+  );
   assert.equal(await page.getByLabel('Field 1 value', { exact: true }).inputValue(), 'Rina Contoh');
   assert.equal(await page.locator('.metadata-field').count(), 3);
+  const notices = page.locator('.metadata-notices');
+  assert.match(
+    await notices.locator('summary').innerText(),
+    /3 review notices.*Check completeness/s,
+  );
+  assert.equal(await notices.evaluate((element) => element.open), false);
+  assert.equal(await notices.locator('li').first().isVisible(), false);
+  await notices.locator('summary').click();
+  await page.waitForFunction(() => new URL(location.href).searchParams.get('notices') === '1');
+  assert.equal(new URL(page.url()).searchParams.get('notices'), '1');
+  assert.equal(await notices.locator('li').first().innerText(), reviewNotices[1]);
+  await page.reload();
+  await page.getByLabel('Field 1 value', { exact: true }).waitFor();
+  assert.equal(await notices.evaluate((element) => element.open), true);
+  assert.equal(await notices.locator('li').count(), 3);
+  await notices.locator('summary').click();
+  await page.waitForFunction(() => new URL(location.href).searchParams.get('notices') === '0');
+  assert.equal(new URL(page.url()).searchParams.get('notices'), '0');
+  assert.equal(await notices.locator('li').first().isVisible(), false);
+  assert.deepEqual(
+    (await f.pool.query('SELECT metadata_json FROM documents WHERE batch_id=$1', [batch.id]))
+      .rows[0].metadata_json.warnings,
+    reviewNotices,
+    'Collapsing notices does not dismiss or resolve them',
+  );
   await page.getByLabel('Field 1 value', { exact: true }).fill('Rina Reviewed');
   await page.getByRole('button', { name: 'Save metadata', exact: true }).click();
   await page

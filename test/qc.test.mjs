@@ -49,6 +49,12 @@ async function drain(f) {
   await f.app.qc.refresh();
 }
 const detail = async (client, id) => good(await client.request(`/api/qc/${id}`));
+const send = async (client, id, resubmit = false) =>
+  good(
+    await client.request(`/api/batches/${id}/${resubmit ? 'resubmit-qc' : 'submit-qc'}`, {
+      version: (await detail(client, id)).batch.version,
+    }),
+  );
 const mutate = async (client, id, action, body = {}) =>
   client.request(`/api/qc/${id}/${action}`, {
     version: (await detail(client, id)).document.version,
@@ -86,9 +92,52 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
     capture_order,
   }));
   good(await op.request(`/api/batches/${b.id}/complete-capture`, { version: b.version }));
+  const preparing = good(await op.request('/api/batches?status=capture_completed'));
+  assert.equal(preparing.total, 1);
+  assert.equal(preparing.batches[0].workflow_status, 'operator_preparation');
+  assert.equal(preparing.counts.submitted, 0);
+  assert.equal(
+    (await op.request(`/api/batches/${b.id}/submit-qc`, { version: preparing.batches[0].version }))
+      .body.code,
+    'ocr_pending',
+  );
   await drain(f);
+  const ready = await detail(op, b.id);
+  assert.equal(ready.document.workflow_status, 'operator_preparation');
+  for (const filter of ['all', 'waiting', 'ocr_incomplete'])
+    assert.equal(good(await qc.request(`/api/qc/queue?filter=${filter}`)).total, 0);
+  assert.equal((await qc.request(`/api/qc/${b.id}`)).status, 403);
+  assert.equal((await qc.request(`/api/batches/${b.id}`)).status, 403);
+  assert.equal((await qc.request(`/api/pages/${capture.pages[0].id}/original`)).status, 403);
+  assert.equal(
+    (await qc.request(`/api/qc/${b.id}/claim`, { version: ready.document.version })).status,
+    403,
+  );
+  const renamed = good(
+    await op.request(
+      `/api/pages/${capture.pages[0].id}`,
+      {
+        version: ready.batch.version,
+        action: 'rename',
+        label: 'Prepared cover',
+      },
+      'PATCH',
+    ),
+  );
+  assert.equal(renamed.pages[0].page_label, 'Prepared cover');
+  const submitted = await send(op, b.id);
+  assert.ok(submitted.batch.submitted_at);
+  assert.equal((await detail(op, b.id)).reviews[0].submitted_by, op.user.id);
   let d = await detail(qc, b.id);
   assert.equal(d.document.workflow_status, 'qc_waiting');
+  assert.equal(good(await op.request('/api/batches?status=capture_completed')).total, 0);
+  assert.equal(good(await op.request('/api/batches?status=submitted')).total, 1);
+  assert.equal((await op.request(meta, fieldsBody(d.metadata), 'PATCH')).status, 409);
+  assert.equal(
+    (await op.request(`/api/batches/${b.id}/submit-qc`, { version: submitted.batch.version }))
+      .status,
+    409,
+  );
   const queue = good(
     await qc.request(
       '/api/qc/queue?filter=all&metadata=needs_review&ocr=completed&sort=created_at&direction=desc',
@@ -125,6 +174,40 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
   const winner = claims[0].status === 200 ? qc : qc2,
     loser = winner === qc ? qc2 : qc;
   d = await detail(winner, b.id);
+  const tracking = good(
+    await op.request('/api/batches?status=submitted&sort=workflow_status&direction=asc&limit=1'),
+  );
+  assert.equal(tracking.total, 1);
+  assert.equal(tracking.pages, capture.pages.length);
+  assert.equal(tracking.sessions, 2);
+  assert.equal(tracking.counts.capture_completed, 0);
+  assert.equal(tracking.counts.submitted, 1);
+  assert.equal(tracking.counts.completed, 0);
+  assert.equal(tracking.batches[0].id, b.id);
+  assert.equal(tracking.batches[0].workflow_status, 'qc_in_review');
+  assert.equal(tracking.batches[0].qc_reviewer, winner.user.display_name);
+  assert.equal(tracking.batches[0].qc_claim_live, true);
+  assert.equal(good(await op.request('/api/batches?status=capture_completed')).total, 0);
+  const filteredTracking = good(
+    await op.request('/api/batches?status=submitted&search=no-such-batch'),
+  );
+  assert.equal(filteredTracking.total, 0);
+  assert.equal(filteredTracking.pages, 0);
+  assert.equal(filteredTracking.counts.submitted, 1);
+  const privateTracking = good(await stranger.request('/api/batches?status=submitted'));
+  assert.equal(privateTracking.total, 0);
+  assert.equal(privateTracking.counts.submitted, 0);
+  assert.equal(good(await f.admin.request('/api/batches?status=submitted')).total, 1);
+  assert.equal(
+    (
+      await mutate(loser, b.id, 'page-edit', {
+        pageId: d.pages[0].id,
+        action: 'rename',
+        label: 'Not my claim',
+      })
+    ).status,
+    409,
+  );
   assert.equal((await op.request(meta, fieldsBody(d.metadata), 'PATCH')).status, 403);
   assert.equal(
     (
@@ -139,6 +222,7 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
     409,
   );
   assert.equal((await mutate(winner, b.id, 'pass')).status, 409);
+  assert.equal(good(await op.request('/api/batches?status=rework')).returned, 0);
   good(
     await mutate(winner, b.id, 'findings', {
       pageIds: [d.pages[0].id],
@@ -156,7 +240,48 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
   d = await detail(op, b.id);
   assert.equal(d.document.workflow_status, 'rework');
   assert.equal(d.batch.status, 'paused');
+  assert.equal(good(await op.request('/api/batches?status=paused')).total, 0);
+  assert.equal(good(await op.request('/api/batches?status=submitted')).total, 0);
+  const returned = good(
+    await op.request('/api/batches?status=rework&sort=returned_at&direction=desc'),
+  );
+  assert.equal(returned.total, 1);
+  assert.equal(returned.returned, 1);
+  assert.equal(returned.pages, capture.pages.length);
+  assert.equal(returned.sessions, 2);
+  assert.equal(returned.batches[0].id, b.id);
+  assert.equal(returned.batches[0].workflow_status, 'rework');
+  assert.equal(
+    returned.batches[0].qc_return_reason,
+    'Replace blurry page and insert missing page.',
+  );
+  assert.equal(returned.batches[0].qc_returned_at, d.reviews[0].decided_at);
+  const filteredReturns = good(await op.request('/api/batches?status=rework&search=no-such-batch'));
+  assert.equal(filteredReturns.total, 0);
+  assert.equal(
+    filteredReturns.returned,
+    1,
+    'Return count is independent of list search and pagination',
+  );
+  const hiddenReturns = good(await stranger.request('/api/batches?status=rework'));
+  assert.equal(hiddenReturns.total, 0);
+  assert.equal(
+    hiddenReturns.returned,
+    0,
+    'Another operator cannot see or count private returned work',
+  );
+  assert.equal(good(await f.admin.request('/api/batches?status=rework')).returned, 1);
   b = good(await op.request(`/api/batches/${b.id}/resume`, { version: d.batch.version })).batch;
+  assert.equal(
+    b.qc_returned_at,
+    d.reviews[0].decided_at,
+    'Resuming must not change the QC return date',
+  );
+  assert.equal(
+    good(await op.request('/api/batches?status=rework')).batches[0].status,
+    'in_progress',
+  );
+  assert.equal(good(await op.request('/api/batches?status=in_progress')).total, 0);
   const target = d.pages[0].id;
   good(
     await op.request(`/api/batches/${b.id}/scan-sessions`, {
@@ -223,7 +348,23 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
     }),
   );
   assert.equal(capture.pages[0].id, last.id);
-  good(await op.request(`/api/batches/${b.id}/resubmit-qc`, { version: capture.batch.version }));
+  good(
+    await op.request(`/api/batches/${b.id}/complete-capture`, { version: capture.batch.version }),
+  );
+  assert.equal((await detail(op, b.id)).document.workflow_status, 'rework');
+  assert.equal(good(await op.request('/api/batches?status=submitted')).total, 0);
+  await drain(f);
+  await send(op, b.id, true);
+  assert.equal(good(await op.request('/api/batches?status=capture_completed')).total, 0);
+  assert.equal(
+    good(await op.request('/api/batches?status=submitted')).total,
+    1,
+    'Explicit resubmission moves returned work back into tracking',
+  );
+  assert.equal(good(await op.request('/api/batches?status=rework')).total, 0);
+  assert.equal(good(await op.request('/api/batches?status=paused')).returned, 0);
+  assert.equal(good(await op.request(`/api/batches/${b.id}`)).batch.qc_return_reason, null);
+  assert.equal(good(await op.request(`/api/batches/${b.id}`)).batch.qc_returned_at, null);
   await drain(f);
   d = await detail(winner, b.id);
   assert.equal(d.reviews.length, 2);
@@ -242,6 +383,20 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
   );
   good(await mutate(winner, b.id, 'claim'));
   d = await detail(winner, b.id);
+  good(
+    await mutate(winner, b.id, 'page-edit', {
+      pageId: target,
+      action: 'rename',
+      label: 'Reviewed cover',
+    }),
+  );
+  d = await detail(winner, b.id);
+  assert.equal(d.pages.find((p) => p.id === target).page_label, 'Reviewed cover');
+  const included = d.pages.filter((p) => !p.is_excluded && !p.replacement_candidate);
+  assert.deepEqual(
+    included.map((p) => p.page_number),
+    included.map((_, i) => i + 1),
+  );
   good(await winner.request(meta, fieldsBody(d.metadata, true), 'PATCH'));
   d = await detail(winner, b.id);
   const finding = d.findings[0];
@@ -268,8 +423,40 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
   good(await mutate(winner, b.id, 'pass'));
   d = await detail(winner, b.id);
   assert.equal(d.document.workflow_status, 'awaiting_approval_l1');
+  const passedTracking = good(await op.request('/api/batches?status=submitted'));
+  assert.equal(passedTracking.total, 1);
+  assert.equal(passedTracking.batches[0].workflow_status, 'awaiting_approval_l1');
+  assert.equal(passedTracking.batches[0].qc_reviewer, winner.user.display_name);
+  assert.equal(
+    good(await op.request('/api/batches?status=completed')).total,
+    0,
+    'QC Pass is not final approval',
+  );
+  assert.equal(good(await op.request('/api/batches?status=capture_completed')).total, 0);
   assert.equal(d.reviews[0].outcome, 'passed');
   assert.ok(d.reviews[0].snapshot);
+  assert.equal(
+    d.reviews[0].snapshot.pages.find((p) => p.id === target).page_label,
+    'Reviewed cover',
+  );
+  assert.deepEqual(
+    d.reviews[0].snapshot.pages.map((p) => p.page_number),
+    included.map((p) => p.page_number),
+  );
+  assert.equal(
+    (
+      await mutate(winner, b.id, 'page-edit', {
+        pageId: target,
+        action: 'rename',
+        label: 'Too late',
+      })
+    ).status,
+    409,
+  );
+  await assert.rejects(
+    f.pool.query('UPDATE pages SET page_label=$2 WHERE id=$1', [target, 'Bypass']),
+    /locked/,
+  );
   assert.equal((await op.request(meta, fieldsBody(d.metadata), 'PATCH')).status, 409);
   assert.equal(
     (await mutate(winner, b.id, 'page-edit', { pageId: target, action: 'rotate-right' })).status,
@@ -277,6 +464,76 @@ test('QC: capture, manual metadata, claims, findings, same-batch rework, replace
   );
   assert.equal((await op.request(`/api/batches/${b.id}/ocr`, {})).status, 409);
   assert.ok(mock.calls > 0);
+});
+
+test('QC: scan-only operators may send terminal OCR warnings without filling metadata; paused OCR blocks handoff', async (t) => {
+  const f = await testApplication(t, { ocr: { provider: mockOcr().provider } });
+  const op = await f.account(),
+    qc = await f.account(['qc_officer']),
+    stranger = await f.account();
+  let c = good(await op.request('/api/batches', {}));
+  c = await scanned(op, c.batch, { scenario: 'single', pageDelay: 0 });
+  const id = c.batch.id;
+  c = good(await op.request(`/api/batches/${id}/complete-capture`, { version: c.batch.version }));
+  const jobId = c.batch.ocr_job_id;
+  let job = good(await op.request(`/api/ocr/jobs/${jobId}`)).job;
+  good(await op.request(`/api/ocr/jobs/${jobId}/pause`, { version: job.version }));
+  assert.equal(
+    (await op.request(`/api/batches/${id}/submit-qc`, { version: c.batch.version })).body.code,
+    'ocr_pending',
+  );
+  job = good(await op.request(`/api/ocr/jobs/${jobId}`)).job;
+  good(await op.request(`/api/ocr/jobs/${jobId}/resume`, { version: job.version }));
+  job = good(await op.request(`/api/ocr/jobs/${jobId}`)).job;
+  good(await op.request(`/api/ocr/jobs/${jobId}/cancel`, { version: job.version }));
+  await f.app.qc.refresh();
+  const before = await detail(op, id);
+  assert.equal(before.metadata.fields.length, 0);
+  assert.equal(
+    (await stranger.request(`/api/batches/${id}/submit-qc`, { version: before.batch.version }))
+      .status,
+    403,
+  );
+  assert.equal((await op.request(`/api/batches/${id}/submit-qc`, { version: 0 })).status, 409);
+  await send(op, id);
+  assert.equal(good(await qc.request('/api/qc/queue?filter=waiting')).total, 1);
+  assert.equal(good(await qc.request(`/api/ocr/jobs/${jobId}`)).job.status, 'cancelled');
+  assert.equal((await op.request(`/api/batches/${id}/ocr`, {})).status, 409);
+  assert.equal(
+    (
+      await op.request(
+        `/api/pages/${c.pages[0].id}`,
+        { version: (await detail(op, id)).batch.version, action: 'rename', label: 'Too late' },
+        'PATCH',
+      )
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await mutate(qc, id, 'page-edit', {
+        pageId: c.pages[0].id,
+        action: 'rename',
+        label: 'Unclaimed',
+      })
+    ).status,
+    409,
+  );
+  good(await mutate(qc, id, 'claim'));
+  const d = await detail(qc, id);
+  good(
+    await qc.request(
+      `/api/batches/${id}/metadata`,
+      {
+        version: d.metadata.version,
+        fields: [
+          { id: null, type: 'title', value: 'Filled by QC', context: '', verification: 'verified' },
+        ],
+      },
+      'PATCH',
+    ),
+  );
+  assert.equal((await detail(qc, id)).metadata.fields[0].value, 'Filled by QC');
 });
 
 test('QC: stale claim recovery, release, self-QC, CSRF, current text corrections and non-destructive page edits', async (t) => {
@@ -289,6 +546,7 @@ test('QC: stale claim recovery, release, self-QC, CSRF, current text corrections
   batch = (await scanned(op, batch, { scenario: 'multi', pageDelay: 0 })).batch;
   good(await op.request(`/api/batches/${batch.id}/complete-capture`, { version: batch.version }));
   await drain(f);
+  await send(op, batch.id);
   let d = await detail(a, batch.id);
   assert.equal((await mutate(op, batch.id, 'claim')).body.code, 'self_qc');
   assert.equal(
@@ -305,6 +563,10 @@ test('QC: stale claim recovery, release, self-QC, CSRF, current text corrections
     "UPDATE qc_reviews SET claim_expires_at=now()-interval '1 minute' WHERE document_id=$1",
     [d.document.id],
   );
+  const expiredTracking = good(await op.request('/api/batches?status=submitted'));
+  assert.equal(expiredTracking.total, 1);
+  assert.equal(expiredTracking.batches[0].qc_claim_live, false);
+  assert.equal(good(await op.request('/api/batches?status=capture_completed')).total, 0);
   assert.equal(
     (await mutate(a, batch.id, 'page-review', { pageIds: [d.pages[0].id], status: 'reviewed' }))
       .status,
@@ -312,6 +574,11 @@ test('QC: stale claim recovery, release, self-QC, CSRF, current text corrections
   );
   good(await mutate(b, batch.id, 'claim'));
   good(await mutate(b, batch.id, 'release'));
+  const releasedTracking = good(await op.request('/api/batches?status=submitted'));
+  assert.equal(releasedTracking.total, 1);
+  assert.equal(releasedTracking.batches[0].workflow_status, 'qc_waiting');
+  assert.equal(releasedTracking.batches[0].qc_reviewer, null);
+  assert.equal(good(await op.request('/api/batches?status=capture_completed')).total, 0);
   good(await mutate(a, batch.id, 'claim'));
   d = await detail(a, batch.id);
   const page = d.pages[0];
@@ -443,6 +710,7 @@ test('QC: metadata concurrency, policies, cancelled replacement and integrity bl
   c = good(await op.request(`/api/batches/${id}`));
   good(await op.request(`/api/batches/${id}/complete-capture`, { version: c.batch.version }));
   await drain(f);
+  await send(op, id);
   good(await mutate(qc, id, 'claim'));
   d = await detail(qc, id);
   good(await qc.request(url, fieldsBody(d.metadata, true), 'PATCH'));
@@ -479,6 +747,7 @@ test('QC: an OCR exception cannot pass a revision while outstanding jobs may sti
   const id = c.batch.id;
   good(await op.request(`/api/batches/${id}/complete-capture`, { version: c.batch.version }));
   await drain(f);
+  await send(op, id);
   good(await mutate(qc, id, 'claim'));
   good(await mutate(qc, id, 'reprocess-ocr', { requestId: crypto.randomUUID() }));
   good(

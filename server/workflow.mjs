@@ -1,4 +1,4 @@
-import { requirePermission } from './auth.mjs';
+import { audit, requirePermission, text } from './auth.mjs';
 import { failure } from './errors.mjs';
 
 export function checkVersion(record, version) {
@@ -15,16 +15,34 @@ export async function documentFor(client, batchId, lock = false) {
   ).rows[0];
 }
 
-export async function operatorEdit(client, user, batch, metadata = false) {
+export const submittedBatch = `EXISTS(SELECT 1 FROM documents submitted_document
+  JOIN qc_reviews submitted_review ON submitted_review.document_id=submitted_document.id
+    AND submitted_review.cycle=submitted_document.review_cycle
+  WHERE submitted_document.batch_id=b.id AND submitted_review.submitted_at IS NOT NULL)`;
+
+export async function requireSubmission(client, user, batch) {
+  if (batch.assigned_operator_id === user.id || user.permissions.includes('batches:reassign'))
+    return;
+  const result = await client.query(
+    `SELECT ${submittedBatch} AS submitted FROM archive_batches b WHERE b.id=$1`,
+    [batch.id],
+  );
+  if (!result.rows[0]?.submitted)
+    throw failure('not_submitted', 'This document has not been sent to QC.', 403);
+}
+
+export async function operatorEdit(client, user, batch) {
   requirePermission(user, 'batches:update');
   const doc = await documentFor(client, batch.id, true);
   if (batch.assigned_operator_id !== user.id)
     throw failure('forbidden', 'This batch is assigned to another operator.', 403);
-  const states = metadata
-    ? ['capturing', 'rework', 'preparing', 'qc_waiting']
-    : ['capturing', 'rework'];
+  const states = ['capturing', 'rework', 'operator_preparation'];
   if (!doc || !states.includes(doc.workflow_status))
-    throw failure('document_locked', 'The document is locked by QC or has passed QC.', 409);
+    throw failure(
+      'document_locked',
+      'This document has been sent to QC. Wait for a return before editing.',
+      409,
+    );
   return doc;
 }
 
@@ -37,6 +55,23 @@ export async function bumpDocument(client, batchId) {
     `UPDATE qc_reviews r SET ordering_reviewed=false,completeness_reviewed=false,
     metadata_reviewed=false WHERE document_id IN (SELECT id FROM documents WHERE batch_id=$1) AND outcome IS NULL`,
     [batchId],
+  );
+}
+
+export async function setPageLabel(client, user, page, value) {
+  const label = text(value, 120, 'Page label', true);
+  await client.query('UPDATE pages SET page_label=$2,updated_at=now() WHERE id=$1', [
+    page.id,
+    label,
+  ]);
+  await audit(
+    client,
+    user,
+    'page.renamed',
+    'page',
+    page.id,
+    { customLabel: label !== null },
+    page.batch_id,
   );
 }
 

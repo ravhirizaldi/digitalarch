@@ -3,7 +3,14 @@ import { transaction } from './db.mjs';
 import { audit, keys, requirePermission, text, uuid } from './auth.mjs';
 import { failure } from './errors.mjs';
 import { listPages } from './storage.mjs';
-import { operatorEdit, bumpDocument, noCapture } from './workflow.mjs';
+import {
+  operatorEdit,
+  bumpDocument,
+  noCapture,
+  setPageLabel,
+  submittedBatch,
+  requireSubmission,
+} from './workflow.mjs';
 import { fieldsOf, persistMetadata } from './qc-metadata.mjs';
 
 export function batchCode(now = new Date()) {
@@ -29,8 +36,14 @@ const summary = `SELECT b.*,u.display_name AS assigned_operator,
   (SELECT count(*)::int FROM scan_sessions s WHERE s.batch_id=b.id) AS session_count,
   (SELECT count(*)::int FROM scan_sessions s WHERE s.batch_id=b.id AND s.status='completed') AS completed_sessions,
   (SELECT j.id FROM ocr_jobs j WHERE j.batch_id=b.id ORDER BY j.created_at DESC,j.id DESC LIMIT 1) AS ocr_job_id
-   ,(SELECT workflow_status FROM documents WHERE batch_id=b.id ORDER BY document_index LIMIT 1) AS workflow_status
-   FROM archive_batches b LEFT JOIN users u ON u.id=b.assigned_operator_id`;
+   ,d.workflow_status,r.submitted_at,
+   CASE WHEN d.workflow_status='rework' AND r.outcome='returned' THEN r.decision_reason END AS qc_return_reason,
+   CASE WHEN d.workflow_status='rework' AND r.outcome='returned' THEN r.decided_at END AS qc_returned_at,
+   reviewer.display_name AS qc_reviewer,coalesce(r.claim_expires_at>now(),false) AS qc_claim_live
+   FROM archive_batches b LEFT JOIN users u ON u.id=b.assigned_operator_id
+   LEFT JOIN LATERAL (SELECT * FROM documents WHERE batch_id=b.id ORDER BY document_index LIMIT 1) d ON true
+   LEFT JOIN qc_reviews r ON r.document_id=d.id AND r.cycle=d.review_cycle
+   LEFT JOIN users reviewer ON reviewer.id=coalesce(r.claimed_by,r.decided_by)`;
 
 export function batchOperations(
   pool,
@@ -55,9 +68,13 @@ export function batchOperations(
         409,
       );
   }
-  const mutable = (batch) => {
+  const mutable = (batch, preparation = false) => {
     if (batch.deleted_at) throw failure('not_found', 'Batch not found.', 404);
-    if (!['in_progress', 'paused'].includes(batch.status))
+    if (
+      !['in_progress', 'paused', ...(preparation ? ['capture_completed'] : [])].includes(
+        batch.status,
+      )
+    )
       throw failure(
         'batch_locked',
         'Capture-completed or cancelled batches cannot be modified.',
@@ -94,6 +111,7 @@ export function batchOperations(
         await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
         const batch = (await client.query(`${summary} WHERE b.id=$1`, [id])).rows[0];
         ownership(user, batch);
+        await requireSubmission(client, user, batch);
         const sessions = (
           await client.query(
             'SELECT * FROM scan_sessions WHERE batch_id=$1 ORDER BY session_number',
@@ -102,7 +120,7 @@ export function batchOperations(
         ).rows;
         const pages = (
           await client.query(
-            'SELECT * FROM pages WHERE batch_id=$1 ORDER BY display_order,capture_order',
+            'SELECT * FROM document_pages WHERE batch_id=$1 ORDER BY display_order,capture_order',
             [id],
           )
         ).rows;
@@ -114,7 +132,7 @@ export function batchOperations(
       {
         search = '',
         status = '',
-        sort = 'updated_at',
+        sort = status === 'rework' ? 'returned_at' : 'updated_at',
         direction = 'desc',
         limit = 25,
         offset = 0,
@@ -129,11 +147,26 @@ export function batchOperations(
         session_count: 'session_count',
         status: 'b.status',
         assigned_operator: 'u.display_name',
+        returned_at: 'qc_returned_at',
+        workflow_status: 'd.workflow_status',
       };
       if (!Object.hasOwn(columns, sort) || !['asc', 'desc'].includes(direction))
         throw failure('invalid_request', 'Invalid batch sort.');
       const all = user.permissions.includes('batches:read_all');
-      const where = `WHERE b.deleted_at IS NULL AND ($1::boolean OR b.assigned_operator_id=$2) AND ($3='' OR b.status=$3)
+      const scope = `b.deleted_at IS NULL AND ($1::boolean OR b.assigned_operator_id=$2)
+        ${user.permissions.includes('batches:reassign') ? '' : `AND (b.assigned_operator_id=$2 OR ${submittedBatch})`}`;
+      const rework = `EXISTS(SELECT 1 FROM documents d WHERE d.batch_id=b.id AND d.workflow_status='rework')`;
+      const handedOff = submittedBatch;
+      const approved = `EXISTS(SELECT 1 FROM documents d WHERE d.batch_id=b.id AND d.workflow_status='approved')`;
+      const views = {
+        in_progress: `b.status='in_progress' AND NOT ${rework}`,
+        paused: `b.status='paused' AND NOT ${rework}`,
+        capture_completed: `b.status='capture_completed' AND NOT ${rework} AND NOT ${handedOff} AND NOT ${approved}`,
+        rework,
+        submitted: `b.status='capture_completed' AND NOT ${rework} AND ${handedOff} AND NOT ${approved}`,
+        completed: approved,
+      };
+      const where = `WHERE ${scope} AND ($3='' OR (${Object.hasOwn(views, status) ? views[status] : 'b.status=$3'}))
         AND ($4='' OR strpos(lower(b.batch_code),lower($4))>0 OR strpos(lower(coalesce(b.physical_location,'')),lower($4))>0)`;
       const args = [all, user.id, status, search];
       return transaction(pool, async (client) => {
@@ -159,7 +192,16 @@ export function batchOperations(
             [user.id],
           )
         ).rows;
-        return { batches: rows, ...totals, activity };
+        const counts = (
+          await client.query(
+            `SELECT ${Object.entries(views)
+              .map(([key, filter]) => `count(*) FILTER(WHERE ${filter})::int AS ${key}`)
+              .join(',')}
+             FROM archive_batches b WHERE ${scope}`,
+            [all, user.id],
+          )
+        ).rows[0];
+        return { batches: rows, ...totals, returned: counts.rework, counts, activity };
       });
     },
     async create(user, body) {
@@ -191,7 +233,7 @@ export function batchOperations(
           await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
         ).rows[0];
         ownership(user, batch, true);
-        mutable(batch);
+        mutable(batch, true);
         const doc = await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
@@ -246,6 +288,7 @@ export function batchOperations(
         ).rows[0];
         ownership(user, batch, true);
         if (operation === 'complete-capture' && batch.status === 'capture_completed') {
+          await operatorEdit(client, user, batch);
           const existing = await client.query('SELECT id FROM ocr_jobs WHERE batch_id=$1 LIMIT 1', [
             id,
           ]);
@@ -254,7 +297,7 @@ export function batchOperations(
           return;
         }
         mutable(batch);
-        const document = await operatorEdit(client, user, batch);
+        await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
         const states = {
@@ -303,16 +346,6 @@ export function batchOperations(
         await bump(client, id);
         if (operation === 'complete-capture')
           await client.query('SELECT queue_batch_ocr($1,$2,$3)', [id, ocrLanguage, ocrConfig]);
-        if (operation === 'complete-capture' && document.workflow_status === 'rework')
-          await audit(
-            client,
-            user,
-            'qc.resubmitted',
-            'document',
-            document.id,
-            { previousCycle: document.review_cycle },
-            id,
-          );
         await audit(
           client,
           user,
@@ -328,6 +361,80 @@ export function batchOperations(
             pages: pages.filter((page) => !page.is_excluded).length,
             acknowledgedPartial: body.acknowledgePartial === true,
           },
+          id,
+        );
+      });
+      return api.get(user, id);
+    },
+    async submit(user, id, body, resubmit = false) {
+      uuid(id);
+      keys(body, ['version']);
+      requirePermission(user, 'batches:complete_capture');
+      await transaction(pool, async (client) => {
+        const batch = (
+          await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
+        ).rows[0];
+        ownership(user, batch, true);
+        version(batch, body.version);
+        const doc = await operatorEdit(client, user, batch);
+        if (doc.workflow_status !== (resubmit ? 'rework' : 'operator_preparation'))
+          throw failure(
+            'workflow_locked',
+            resubmit
+              ? 'This document is not in rework.'
+              : 'Complete capture before sending this document to QC.',
+            409,
+          );
+        if (batch.status !== 'capture_completed')
+          throw failure(
+            'capture_pending',
+            'Complete capture before sending this document to QC.',
+            409,
+          );
+        await noCapture(client, id);
+        const jobs = (await client.query('SELECT status FROM ocr_jobs WHERE batch_id=$1', [id]))
+          .rows;
+        if (
+          !jobs.length ||
+          jobs.some(
+            (job) =>
+              !['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(job.status),
+          )
+        )
+          throw failure(
+            'ocr_pending',
+            'Wait for OCR to finish. Resume paused OCR or cancel an unleased queued run before sending to QC.',
+            409,
+          );
+        const pages = (
+          await client.query(
+            'SELECT * FROM pages WHERE batch_id=$1 AND NOT is_excluded AND NOT replacement_candidate',
+            [id],
+          )
+        ).rows;
+        if (!pages.length)
+          throw failure(
+            'empty_batch',
+            'Keep at least one included page before sending to QC.',
+            409,
+          );
+        for (const page of pages) await storage.validate(page);
+        await client.query(
+          `INSERT INTO qc_reviews(document_id,cycle,submitted_by,submitted_at) VALUES($1,$2,$3,now())`,
+          [doc.id, doc.review_cycle + 1, user.id],
+        );
+        await client.query(
+          `UPDATE documents SET workflow_status='qc_waiting',review_cycle=review_cycle+1 WHERE id=$1`,
+          [doc.id],
+        );
+        await bump(client, id);
+        await audit(
+          client,
+          user,
+          resubmit ? 'qc.resubmitted' : 'qc.submitted',
+          'document',
+          doc.id,
+          { cycle: doc.review_cycle + 1, revision: doc.revision + 1 },
           id,
         );
       });
@@ -710,9 +817,9 @@ export function batchOperations(
     },
     async editPage(user, id, body) {
       uuid(id);
-      keys(body, ['version', 'action']);
+      keys(body, ['version', 'action', 'label']);
       if (
-        !['rotate-left', 'rotate-right', 'reset-rotation', 'remove', 'restore'].includes(
+        !['rotate-left', 'rotate-right', 'reset-rotation', 'remove', 'restore', 'rename'].includes(
           body.action,
         )
       )
@@ -726,7 +833,7 @@ export function batchOperations(
           await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [batchId])
         ).rows[0];
         ownership(user, batch, true);
-        mutable(batch);
+        mutable(batch, true);
         await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, batchId);
@@ -734,6 +841,12 @@ export function batchOperations(
           .rows[0];
         if (page.replacement_candidate)
           throw failure('replacement_pending', 'Confirm or cancel this replacement first.', 409);
+        if (body.action === 'rename') {
+          await noCapture(client, batchId);
+          await setPageLabel(client, user, page, body.label);
+          await bump(client, batchId);
+          return;
+        }
         const rotating = body.action.startsWith('rotate-') || body.action === 'reset-rotation';
         if (rotating && page.is_excluded)
           throw failure('page_removed', 'Restore this page before rotating it.', 409);
@@ -850,7 +963,7 @@ export function batchOperations(
           await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
         ).rows[0];
         ownership(user, batch, true);
-        mutable(batch);
+        mutable(batch, true);
         await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
@@ -891,6 +1004,10 @@ export function batchOperations(
         )
       ).rows[0];
       ownership(user, page);
+      await requireSubmission(pool, user, {
+        id: page.batch_id,
+        assigned_operator_id: page.assigned_operator_id,
+      });
       return page;
     },
   };

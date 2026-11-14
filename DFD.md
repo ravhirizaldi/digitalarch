@@ -1,6 +1,6 @@
 # Data flow diagrams
 
-**As-built baseline: 2026-11-14.** These Mermaid diagrams describe implemented capture/OCR/QC flows. They are source-derived documentation, not evidence that a new scan or inference was run. [APPROVAL.md](APPROVAL.md) contains the separate planned extension.
+**As-built baseline: 2026-11-15.** These Mermaid diagrams describe implemented capture/OCR/QC flows, including explicit operator submission in migration 014. They are source-derived documentation, not evidence that a new scan or inference was run. [APPROVAL.md](APPROVAL.md) contains the separate planned extension.
 
 ## 1. System context
 
@@ -119,13 +119,16 @@ sequenceDiagram
     A->>F: Validate PNG and finalize managed original
     A->>D: Register page and update session counters
     O->>A: Complete Capture with current version
-    A->>D: Commit capture completion, review cycle and OCR enqueue
+    A->>D: Commit capture completion, operator preparation and OCR enqueue
     W->>D: Claim queued work and commit lease
     W->>F: Read validated image snapshot
     W->>E: Recognize outside database transaction
     E-->>W: Text, geometry and processing outcome
     W->>D: Commit page result using live lease token
-    A->>D: After terminal OCR, prepare metadata and QC readiness
+    A->>D: After terminal OCR, refresh metadata without submission
+    O->>A: Optionally edit metadata/pages, or skip editing
+    O->>A: Explicit Send to QC
+    A->>D: Check capture/OCR terminal, record sender/time, create QC cycle
     Q->>A: Claim document with current version
     A->>D: Check independence and commit exclusive QC claim
     Q->>A: Save review, metadata verification and corrections
@@ -143,7 +146,7 @@ The sequence abbreviates multi-page commits, polling, retries and return/resubmi
 | Boundary                         | Enforcement / limit                                                                                      |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Browser → API                    | Session cookie, same-origin checks, CSRF on mutations, body validation and server-side permission checks |
-| Role → document                  | Assigned-operator checks or explicit QC/oversight permissions; no access inferred from a URL             |
+| Role → document                  | Assigned operator or administrator; QC reads only submitted work, never access inferred from a URL       |
 | Capture spool → managed original | Decode, size/pixel limits, checksum, safe paths and exclusive finalization                               |
 | Worker → database                | Persistent job lease/token, expiry, image/config identity and versioned results                          |
 | QC → decision                    | Live independent claim, version checks, checklist/findings/metadata/OCR/file gates                       |

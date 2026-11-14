@@ -1,5 +1,39 @@
 # DigitalArch — engineering report
 
+## Source handoff (2026-11-15)
+
+The current handoff includes explicit QC submission, optional operator preparation, page labels/numbering, compact worklists/OCR/history, themed workflow notifications and account controls. README includes the high-level operator-to-QC workflow. Earlier statements about local/uncommitted work describe historical checkpoints. Credentials, scans, local models/backups and generated evidence remain excluded. Static lint/format/build/diff checks passed; regression cases remain unexecuted, with no new browser, OCR or scan verification.
+
+## Operator work/tracking separation and white worklists (2026-11-15)
+
+- Capture Workspace/My Batches and the shared admin list have six icon/badge tabs. Explicit **Send to QC** moves Capture Completed work into Submitted / Tracking before any claim. Optional editing can be skipped; OCR must be terminal, but failures/missing metadata remain warnings. Operator mutations lock on sending. QC cannot read unsent work; administrators retain oversight. Rework remains separate until explicit resubmission after capture/OCR. Migration 014 preserves review history and restores never-picked-up automatic entries to preparation.
+- Tracking exposes workflow stage and current QC reviewer/claim validity, with a single operator View document action. QC Pass stays at Awaiting L1. Completed history is final-approved only and remains empty; no approval feature, migration, mutation permission or historical record is changed.
+- Badge counts ignore search/paging but respect current assignment/oversight and deletion; filtered totals reuse identical view predicates. Existing returned reason/date and confirmed non-destructive deletion remain. The tab surface and shared worklist headers are white, retaining icons, badges, borders and the blue selection underline.
+- Lifecycle/privacy/counter/URL and white-surface regression cases were written but not executed. No tests, browser checks, OCR inference or scans were run for these changes.
+
+## OCR list alignment and capture identity badges (2026-11-15)
+
+- Moved Job details into the same right-hand tab panel as Recognized text and Run metadata history. All saved fields remain, now in single-column scrolling descriptions; the separate full-width collapse is removed. OCR counts and progress also move to the existing bottom shell footer through the same status-callback pattern as QC. The footer is job-scoped and cleared when leaving; no extra fetching, inference or job control is introduced. Tab-visibility/footer regression coverage is written but unexecuted.
+- Fixed the narrow OCR-detail page rail: removed the competing Page/Status columns, placing status/stale tags below each page name with bounded names and compact pagination. The previous 150px Page column left too little space for Status, wrapping its header letter by letter.
+- `/ocr` now reuses `WorklistTable`, icon-bearing headings, icon-only batch hover/copy and **Open OCR job** action. It adds batch-code/location search, allowlisted server sorting, filtered job/page/processed/failed totals, right-aligned 25/50/100 pagination and URL-restored list navigation. Existing access scopes, status/progress, overview counts, read-only polling and job controls/history remain intact.
+- Capture context now shows only the batch ID and current scan session as separate compact icon-bearing tags; the “Active batch” prefix and session parentheses are removed. No capture numbering or persistence changes.
+- Added regression cases for list filtering/sorting, literal search, aggregate counts, ownership and list/job navigation; adjusted capture-heading checks. They remain unexecuted per the user's no-testing instruction. No browser, OCR inference or physical capture was run.
+
+## Compact metadata notices and operator returned-work view (2026-11-15)
+
+- Metadata replaces repeated introductory copy and stacked warning alerts with one counted, collapsed review-notices disclosure. A completeness hint remains visible, expanded details put that warning first, and `notices=1/0` persists navigation state without dismissing warnings. Actual errors stay visible.
+- Shared operator/admin batch lists add an icon-bearing **Returned from QC** tab with a count badge. Its compact view shows the full reason through a **(?)** tooltip and sortable **Returned at** QC decision time instead of redundant Status/Created/Activity columns. Returned operator actions are only **Continue rework** and confirmed **Delete batch** icons; findings remain in the document workstation accessed through capture. The view derives from `documents.workflow_status='rework'`; capture states and ownership stay unchanged. Counts respect current assignment/oversight and deletion while ignoring search/paging. Resumed rework retains its return date and remains listed until resubmission.
+- No new schema, approval state, reassignment workflow, OCR inference, scan or test run was added. Regression cases were written for notice disclosure/URL restoration and returned-work filtering, privacy/counts and lifecycle, but remain unexecuted.
+
+## Page identity presentation and labels (2026-11-15)
+
+- Operator/admin batch tables now use QC's icon-only batch heading/copy controls rather than repeating batch-code text. Existing batch sorting remains available.
+- Migration 012 adds an optional page label and the shared `document_pages` logical-number projection. Included pages display Page 1–N after removal/rescanning, including restarting at 1 when all prior scans were removed. Restoring/reordering recalculates positions; immutable capture order, IDs, originals, filenames and machine OCR remain unchanged.
+- A shared pencil/form action edits or clears page labels in capture/rework and independently claimed QC. Capture/QC/OCR page presentation and metadata/finding references use current page names; new QC snapshots preserve labels/numbers. Existing permissions, version checks, capture/replacement guards and post-QC locks apply. Historical snapshots/results remain retained.
+- Migrations 012–013 were applied locally without OCR, scans or test execution. The forward view refinement keeps numbering queries batch-scoped without rewriting the applied 012 checksum. Regression coverage was added in source but not run; no browser/rendered verification is claimed. These changes were local and uncommitted at that checkpoint.
+- Migration 014 was applied locally for explicit QC submission. Its first attempt hit an ambiguous SQL column and rolled back; the qualified-column correction was then applied successfully. No data reset, OCR execution, scan, browser check or test run was performed. Submission/privacy/rework and scan-only regressions were updated in source only. L1/L2 remain unimplemented.
+- Explicit-submission static checks passed: `pnpm lint`, `pnpm format:check`, `pnpm build`, `git diff --check` and the source UI detector (`[]`). The build reports dependency `use client` directives ignored by Vite and the existing large main-chunk warning; no rendered/runtime verification or backend restart is claimed.
+
 ## Current handoff addendum — shared worklists, URLs and documentation (2026-11-14)
 
 - Repository handoff: the user explicitly authorized committing/pushing the current source and documentation to the existing public `ravhirizaldi/digitalarch` repository. Earlier statements about uncommitted local work describe their historical checkpoints. Private `.env`, `.local` scans/models/backups and generated local evidence remain excluded. README is now a short overview; detailed installation and the full documentation index live in [SETUP.md](SETUP.md).
@@ -31,11 +65,11 @@ Inspected capture/session reconciliation, original/derivative storage, authentic
 
 ### D. Lifecycle and review history
 
-One batch is one logical document across all feeder sessions. Capture status remains separate from `documents.workflow_status`: `capturing → preparing → qc_waiting → qc_in_review → awaiting_approval_l1`, or `qc_in_review → rework → preparing` on return/resubmission. Completion and OCR enqueue retain their transaction boundary. Terminal OCR enables rule extraction and queue eligibility; failed pages remain explicit review work. Returning pauses the same assigned batch. Resubmission creates another review cycle and preserves previous decisions, findings, metadata/image revisions and machine results. Decision snapshots record ordered pages, metadata, findings, page-review statuses and effective OCR/correction identities.
+One batch is one logical document across feeder sessions. Capture state remains separate: `capturing → operator_preparation → qc_waiting → qc_in_review → awaiting_approval_l1`, with explicit operator submission between preparation and waiting. OCR completion only refreshes metadata; it does not hand off. Returning pauses the same batch in `rework`; completing capture leaves rework in place until terminal OCR and explicit resubmission. Submissions record actor/time and create review cycles without deleting decisions, findings, revisions or machine results. QC snapshots preserve exact reviewed content. L1/L2 decisions remain unimplemented.
 
 ### E. Metadata ownership, continuity and validation
 
-Current fields live on `documents.metadata_json`, not sessions or OCR jobs. Operators can save before OCR and while preparing/waiting, with independent metadata version checks. A live QC claim exclusively controls verification during review. Rules add candidates and source links without replacing human values. Original suggestions, available bounds, editor/verifier names and times, stale-source flags and candidate provenance remain visible. No invented confidence or source regions are shown. Dates and explicitly NIK-/NPWP-labelled identifiers are validated. Administrators configure required field types per document before review; metadata is not mandatory to start capture. Historical OCR-run endpoints remain readable but reject mutations with a document-workspace link/message.
+Current fields live on `documents.metadata_json`, not sessions or OCR jobs. Operators can save before OCR, during unsent preparation and returned rework, never after sending to QC. Independent metadata version checks remain. A live QC claim controls verification during review. Rules preserve human values and candidate/source provenance. No invented confidence or source regions are shown. Dates and explicitly labelled NIK/NPWP identifiers are validated. Administrator-required fields gate QC Pass, not scan-only operator submission. Historical OCR-run metadata remains read-only.
 
 ### F. Claims, permissions and concurrent edits
 
@@ -85,7 +119,7 @@ This remains a single-runtime local workstation, not an internet-hardened/distri
 
 ## Historical foundation report
 
-**Delivered locally on 2026-11-13.** Authentication, administration and persistent batch capture replace the former global capture/JSON-QC workflow. The user-authorized physical test succeeded. The statements below describe that earlier delivery; the current workspace is a Git repository, and Phase 4 has not been committed or pushed.
+**Delivered locally on 2026-11-13.** Authentication, administration and persistent batch capture replace the former global capture/JSON-QC workflow. The user-authorized physical test succeeded. The statements below describe that earlier delivery, before Phase 4 was committed or pushed.
 
 The foundation sections below retain their historical test/feature scope. **Phase 3A and its accuracy update are documented in [OCR.md](OCR.md)**; no physical scans or browser tests were run for those updates.
 

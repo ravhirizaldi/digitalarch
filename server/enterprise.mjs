@@ -214,8 +214,13 @@ export function enterprise({
           return await ocr.currentDefaults(user);
         if (pathname === '/api/ocr/engines' && method === 'GET') return await ocr.engines(user);
         if (pathname === '/api/ocr/jobs' && method === 'GET') {
+          const search = (url.searchParams.get('search') || '').trim();
+          if (search.length > 240) throw failure('invalid_request', 'Search is too long.');
           return await ocr.list(user, {
             status: url.searchParams.get('status') || '',
+            search,
+            sort: url.searchParams.get('sort') || 'created_at',
+            direction: url.searchParams.get('direction') || 'desc',
             limit: numeric(url.searchParams.get('limit'), 25, 100),
             offset: numeric(url.searchParams.get('offset'), 0, 1_000_000),
           });
@@ -329,14 +334,27 @@ export function enterprise({
           if (method === 'GET') {
             if (!user.permissions.includes('batches:read_all')) permit('batches:read');
             const status = url.searchParams.get('status') || '';
-            if (!['', 'in_progress', 'paused', 'capture_completed', 'cancelled'].includes(status))
+            if (
+              ![
+                '',
+                'in_progress',
+                'paused',
+                'capture_completed',
+                'cancelled',
+                'rework',
+                'submitted',
+                'completed',
+              ].includes(status)
+            )
               throw failure('invalid_status', 'Invalid batch status.');
             const search = url.searchParams.get('search') || '';
             if (search.length > 240) throw failure('invalid_request', 'Search is too long.');
             return await batches.list(user, {
               search,
               status,
-              sort: url.searchParams.get('sort') || 'updated_at',
+              sort:
+                url.searchParams.get('sort') ||
+                (status === 'rework' ? 'returned_at' : 'updated_at'),
               direction: url.searchParams.get('direction') || 'desc',
               limit: numeric(url.searchParams.get('limit'), 25, 100),
               offset: numeric(url.searchParams.get('offset'), 0, 1_000_000),
@@ -344,7 +362,7 @@ export function enterprise({
           }
         }
         const batch = pathname.match(
-          /^\/api\/batches\/([^/]+)(?:\/(resume|pause|complete-capture|resubmit-qc|cancel|scan-sessions|pages|reassign|delete|ocr|replacement|reorder))?$/,
+          /^\/api\/batches\/([^/]+)(?:\/(resume|pause|complete-capture|submit-qc|resubmit-qc|cancel|scan-sessions|pages|reassign|delete|ocr|replacement|reorder))?$/,
         );
         if (batch) {
           const [, id, operation] = batch;
@@ -369,12 +387,9 @@ export function enterprise({
               permit('batches:update');
               return await batches[operation](user, id, body);
             }
-            if (operation === 'resubmit-qc') {
+            if (operation === 'submit-qc' || operation === 'resubmit-qc') {
               permit('batches:complete_capture');
-              const current = await batches.get(user, id);
-              if (current.batch.workflow_status !== 'rework')
-                throw failure('workflow_locked', 'This batch is not in rework.', 409);
-              return await batches.transition(user, id, 'complete-capture', body);
+              return await batches.submit(user, id, body, operation === 'resubmit-qc');
             }
             if (operation === 'ocr') return await ocr.enqueue(user, id, body);
             if (!operation || operation === 'pages')

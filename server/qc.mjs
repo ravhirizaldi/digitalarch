@@ -10,6 +10,8 @@ import {
   operatorEdit,
   bumpDocument,
   publicPage,
+  setPageLabel,
+  requireSubmission,
 } from './workflow.mjs';
 import {
   currentOcr,
@@ -53,6 +55,7 @@ export function qualityControl(pool, storage) {
     )
       throw failure('forbidden', 'You cannot access this document.', 403);
     const doc = await documentFor(client, batchId, lock);
+    await requireSubmission(client, user, batch);
     return { batch, doc };
   }
   async function change(user, batchId, body, operation, qc = true) {
@@ -63,7 +66,7 @@ export function qualityControl(pool, storage) {
       if (qc) {
         await independentReviewer(client, user, batch);
         review = await activeReview(client, doc, user);
-      } else await operatorEdit(client, user, batch, true);
+      } else await operatorEdit(client, user, batch);
       const result = await operation(client, batch, doc, review);
       await client.query('UPDATE documents SET version=version+1,updated_at=now() WHERE id=$1', [
         doc.id,
@@ -132,7 +135,7 @@ export function qualityControl(pool, storage) {
       };
       if (!Object.hasOwn(columns, sort) || !['asc', 'desc'].includes(direction))
         throw failure('invalid_request', 'Invalid QC queue sort.');
-      const where = `WHERE b.deleted_at IS NULL AND d.review_cycle>0 AND
+      const where = `WHERE b.deleted_at IS NULL AND r.submitted_at IS NOT NULL AND
         CASE $1 WHEN 'all' THEN true WHEN 'waiting' THEN d.workflow_status='qc_waiting' OR (d.workflow_status='qc_in_review' AND r.claim_expires_at<=now())
           WHEN 'review' THEN d.workflow_status='qc_in_review' WHEN 'returned' THEN d.workflow_status='rework'
           WHEN 'passed' THEN d.workflow_status='awaiting_approval_l1'
@@ -175,7 +178,7 @@ export function qualityControl(pool, storage) {
         count(*) FILTER(WHERE d.workflow_status='awaiting_approval_l1')::int AS passed,
         count(*) FILTER(WHERE d.workflow_status='preparing' OR coalesce(b.ocr_status,'')<>'completed')::int AS ocr_incomplete,
         count(*) FILTER(WHERE r.claimed_by=$1 AND r.outcome IS NULL)::int AS mine
-        ${from} WHERE b.deleted_at IS NULL AND d.review_cycle>0`,
+         ${from} WHERE b.deleted_at IS NULL AND r.submitted_at IS NOT NULL`,
             [user.id],
           )
         ).rows[0];
@@ -190,7 +193,7 @@ export function qualityControl(pool, storage) {
           await client.query(
             `SELECT p.*,s.session_number,pr.status AS review_status,pr.image_revision AS reviewed_image_revision,
           r.status AS ocr_status,r.id AS result_id,r.image_revision AS ocr_image_revision
-          FROM pages p JOIN scan_sessions s ON s.id=p.scan_session_id
+          FROM document_pages p JOIN scan_sessions s ON s.id=p.scan_session_id
           LEFT JOIN qc_reviews review ON review.document_id=$2 AND review.cycle=$3
           LEFT JOIN qc_page_reviews pr ON pr.review_id=review.id AND pr.page_id=p.id
           LEFT JOIN LATERAL (SELECT r.* FROM page_ocr_results r JOIN ocr_jobs j ON j.id=r.ocr_job_id
@@ -255,6 +258,8 @@ export function qualityControl(pool, storage) {
             [doc.id, doc.review_cycle],
           )
         ).rows[0];
+        if (!review?.submitted_at)
+          throw failure('not_submitted', 'This document has not been sent to QC.', 409);
         if (review.claimed_by && review.claimed_by !== user.id && review.claim_live)
           throw failure('already_claimed', 'Another QC Officer is reviewing this document.', 409);
         await client.query(
@@ -334,7 +339,7 @@ export function qualityControl(pool, storage) {
         if (qc) {
           await independentReviewer(client, user, batch);
           await activeReview(client, doc, user);
-        } else await operatorEdit(client, user, batch, true);
+        } else await operatorEdit(client, user, batch);
         if (extract) {
           keys(body, ['version']);
           if (body.version !== doc.metadata_version)
@@ -572,7 +577,10 @@ export function qualityControl(pool, storage) {
       await load(pool, user, batchId);
       uuid(pageId);
       const page = (
-        await pool.query('SELECT * FROM pages WHERE batch_id=$1 AND id=$2', [batchId, pageId])
+        await pool.query('SELECT * FROM document_pages WHERE batch_id=$1 AND id=$2', [
+          batchId,
+          pageId,
+        ])
       ).rows[0];
       if (!page) throw failure('not_found', 'Page not found.', 404);
       const results = await currentOcr(pool, batchId, { pageId });
@@ -672,7 +680,7 @@ export function qualityControl(pool, storage) {
       });
     },
     async pageEdit(user, batchId, body) {
-      keys(body, ['version', 'pageId', 'action', 'beforePageId']);
+      keys(body, ['version', 'pageId', 'action', 'beforePageId', 'label']);
       uuid(body.pageId);
       return change(user, batchId, body, async (client, batch, doc) => {
         await noCapture(client, batchId);
@@ -683,6 +691,11 @@ export function qualityControl(pool, storage) {
           )
         ).rows[0];
         if (!page) throw failure('not_found', 'Page not found.', 404);
+        if (body.action === 'rename') {
+          await setPageLabel(client, user, page, body.label);
+          await bumpDocument(client, batchId);
+          return;
+        }
         if (body.action === 'reorder') {
           const ids = (
             await client.query(
@@ -741,7 +754,7 @@ export function qualityControl(pool, storage) {
         await noCapture(client, batchId);
         const pages = (
           await client.query(
-            'SELECT * FROM pages WHERE batch_id=$1 AND NOT is_excluded AND NOT replacement_candidate ORDER BY display_order,capture_order',
+            'SELECT * FROM document_pages WHERE batch_id=$1 AND NOT is_excluded AND NOT replacement_candidate ORDER BY display_order,capture_order',
             [batchId],
           )
         ).rows;
@@ -887,7 +900,7 @@ export function qualityControl(pool, storage) {
     async refresh() {
       const documents = (
         await pool.query(`SELECT d.batch_id FROM documents d JOIN archive_batches b ON b.id=d.batch_id
-        WHERE b.status='capture_completed' AND b.deleted_at IS NULL AND d.workflow_status IN ('preparing','qc_waiting','qc_in_review')
+        WHERE b.status='capture_completed' AND b.deleted_at IS NULL AND d.workflow_status IN ('operator_preparation','rework','preparing','qc_waiting','qc_in_review')
         AND EXISTS(SELECT 1 FROM ocr_jobs j WHERE j.batch_id=b.id)`)
       ).rows;
       for (const row of documents)
@@ -896,7 +909,12 @@ export function qualityControl(pool, storage) {
             row.batch_id,
           ]);
           const doc = await documentFor(client, row.batch_id, true);
-          if (!['preparing', 'qc_waiting', 'qc_in_review'].includes(doc.workflow_status)) return;
+          if (
+            !['operator_preparation', 'rework', 'preparing', 'qc_waiting', 'qc_in_review'].includes(
+              doc.workflow_status,
+            )
+          )
+            return;
           const job = (
             await client.query(
               'SELECT status FROM ocr_jobs WHERE batch_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1',
