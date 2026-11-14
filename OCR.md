@@ -1,5 +1,7 @@
 # OCR processing and accuracy
 
+For system-wide Mermaid diagrams, see [DND.md](DND.md), [DFD.md](DFD.md) and [ERD.md](ERD.md). OCR remains separate from capture/QC/approval state. The planned [approval and basic viewer](APPROVAL.md) should reuse saved QC/OCR identities, not start new recognition. Existing accuracy/test evidence below is historical; this documentation update ran no inference or benchmark.
+
 ## Architecture
 
 Capture completion, the OCR job snapshot and page placeholders commit in the same PostgreSQL transaction. Capture remains `capture_completed` and read-only; `ocr_status` tracks the latest OCR run independently. Pre-feature completed batches have **Send to OCR** in their details. No scans are repeated.

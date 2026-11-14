@@ -3,6 +3,8 @@ import { transaction } from './db.mjs';
 import { audit, keys, requirePermission, text, uuid } from './auth.mjs';
 import { failure } from './errors.mjs';
 import { listPages } from './storage.mjs';
+import { operatorEdit, bumpDocument, noCapture } from './workflow.mjs';
+import { fieldsOf, persistMetadata } from './qc-metadata.mjs';
 
 export function batchCode(now = new Date()) {
   const parts = Object.fromEntries(
@@ -27,7 +29,8 @@ const summary = `SELECT b.*,u.display_name AS assigned_operator,
   (SELECT count(*)::int FROM scan_sessions s WHERE s.batch_id=b.id) AS session_count,
   (SELECT count(*)::int FROM scan_sessions s WHERE s.batch_id=b.id AND s.status='completed') AS completed_sessions,
   (SELECT j.id FROM ocr_jobs j WHERE j.batch_id=b.id ORDER BY j.created_at DESC,j.id DESC LIMIT 1) AS ocr_job_id
-  FROM archive_batches b LEFT JOIN users u ON u.id=b.assigned_operator_id`;
+   ,(SELECT workflow_status FROM documents WHERE batch_id=b.id ORDER BY document_index LIMIT 1) AS workflow_status
+   FROM archive_batches b LEFT JOIN users u ON u.id=b.assigned_operator_id`;
 
 export function batchOperations(
   pool,
@@ -81,6 +84,7 @@ export function batchOperations(
       'UPDATE archive_batches SET updated_at=now(),version=version+1 WHERE id=$1',
       [id],
     );
+    await bumpDocument(client, id);
   }
   const api = {
     async get(user, id) {
@@ -105,27 +109,58 @@ export function batchOperations(
         return { batch, sessions, pages };
       });
     },
-    async list(user, { search = '', status = '', limit = 25, offset = 0 } = {}) {
+    async list(
+      user,
+      {
+        search = '',
+        status = '',
+        sort = 'updated_at',
+        direction = 'desc',
+        limit = 25,
+        offset = 0,
+      } = {},
+    ) {
+      const columns = {
+        updated_at: 'b.updated_at',
+        created_at: 'b.created_at',
+        batch_code: 'b.batch_code',
+        physical_location: 'b.physical_location',
+        page_count: 'page_count',
+        session_count: 'session_count',
+        status: 'b.status',
+        assigned_operator: 'u.display_name',
+      };
+      if (!Object.hasOwn(columns, sort) || !['asc', 'desc'].includes(direction))
+        throw failure('invalid_request', 'Invalid batch sort.');
       const all = user.permissions.includes('batches:read_all');
       const where = `WHERE b.deleted_at IS NULL AND ($1::boolean OR b.assigned_operator_id=$2) AND ($3='' OR b.status=$3)
         AND ($4='' OR strpos(lower(b.batch_code),lower($4))>0 OR strpos(lower(coalesce(b.physical_location,'')),lower($4))>0)`;
       const args = [all, user.id, status, search];
-      const rows = (
-        await pool.query(`${summary} ${where} ORDER BY b.updated_at DESC,b.id LIMIT $5 OFFSET $6`, [
-          ...args,
-          limit,
-          offset,
-        ])
-      ).rows;
-      const total = (await pool.query(`SELECT count(*)::int FROM archive_batches b ${where}`, args))
-        .rows[0].count;
-      const activity = (
-        await pool.query(
-          'SELECT action,batch_id,created_at FROM audit_logs WHERE actor_id=$1 AND batch_id IS NOT NULL ORDER BY created_at DESC LIMIT 8',
-          [user.id],
-        )
-      ).rows;
-      return { batches: rows, total, activity };
+      return transaction(pool, async (client) => {
+        await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+        const rows = (
+          await client.query(
+            `${summary} ${where} ORDER BY ${columns[sort]} ${direction.toUpperCase()} NULLS LAST,b.id LIMIT $5 OFFSET $6`,
+            [...args, limit, offset],
+          )
+        ).rows;
+        const totals = (
+          await client.query(
+            `SELECT count(*)::int AS total,
+        coalesce(sum((SELECT count(*) FROM pages p WHERE p.batch_id=b.id AND NOT p.is_excluded)),0)::int AS pages,
+        coalesce(sum((SELECT count(*) FROM scan_sessions s WHERE s.batch_id=b.id)),0)::int AS sessions
+        FROM archive_batches b ${where}`,
+            args,
+          )
+        ).rows[0];
+        const activity = (
+          await client.query(
+            'SELECT action,batch_id,created_at FROM audit_logs WHERE actor_id=$1 AND batch_id IS NOT NULL ORDER BY created_at DESC LIMIT 8',
+            [user.id],
+          )
+        ).rows;
+        return { batches: rows, ...totals, activity };
+      });
     },
     async create(user, body) {
       keys(body, ['physicalLocation']);
@@ -157,12 +192,36 @@ export function batchOperations(
         ).rows[0];
         ownership(user, batch, true);
         mutable(batch);
+        const doc = await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
         await client.query('UPDATE archive_batches SET physical_location=$2 WHERE id=$1', [
           id,
           location,
         ]);
+        const existing = fieldsOf(doc).find((field) => field.type === 'physical_location');
+        if (existing)
+          await persistMetadata(
+            client,
+            doc,
+            location
+              ? fieldsOf(doc).map((field) =>
+                  field.id === existing.id
+                    ? {
+                        ...field,
+                        value: location,
+                        origin: 'manual',
+                        verification: 'needs_review',
+                        editedBy: user.id,
+                        editedByName: user.display_name,
+                        editedAt: new Date().toISOString(),
+                      }
+                    : field,
+                )
+              : fieldsOf(doc).filter((field) => field.id !== existing.id),
+            user,
+            'metadata.updated',
+          );
         await bump(client, id);
         await audit(
           client,
@@ -195,6 +254,7 @@ export function batchOperations(
           return;
         }
         mutable(batch);
+        const document = await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
         const states = {
@@ -214,6 +274,7 @@ export function batchOperations(
             409,
           );
         if (operation === 'complete-capture') {
+          await noCapture(client, id);
           if (!pages.some((page) => !page.is_excluded))
             throw failure(
               'empty_batch',
@@ -242,6 +303,16 @@ export function batchOperations(
         await bump(client, id);
         if (operation === 'complete-capture')
           await client.query('SELECT queue_batch_ocr($1,$2,$3)', [id, ocrLanguage, ocrConfig]);
+        if (operation === 'complete-capture' && document.workflow_status === 'rework')
+          await audit(
+            client,
+            user,
+            'qc.resubmitted',
+            'document',
+            document.id,
+            { previousCycle: document.review_cycle },
+            id,
+          );
         await audit(
           client,
           user,
@@ -328,7 +399,13 @@ export function batchOperations(
     },
     async start(user, id, body) {
       uuid(id);
-      keys(body, ['version', 'options']);
+      keys(body, ['version', 'options', 'placement', 'anchorPageId', 'replacementPageId']);
+      if (body.placement !== undefined && !['append', 'before', 'after'].includes(body.placement))
+        throw failure('invalid_request', 'Choose append, before or after.');
+      if (body.anchorPageId != null) uuid(body.anchorPageId);
+      if (body.replacementPageId != null) uuid(body.replacementPageId);
+      if (body.replacementPageId && body.placement && body.placement !== 'append')
+        throw failure('invalid_request', 'A replacement cannot also insert pages.');
       if (
         body.options !== undefined &&
         (!body.options || typeof body.options !== 'object' || Array.isArray(body.options))
@@ -345,10 +422,27 @@ export function batchOperations(
             ).rows[0];
             ownership(user, batch, true);
             mutable(batch);
+            await operatorEdit(client, user, batch);
             version(batch, body.version);
             if (batch.status !== 'in_progress')
               throw failure('batch_paused', 'Resume this batch before scanning.', 409);
             await noRunning(client, id);
+            await noCapture(client, id);
+            const targetId =
+              body.replacementPageId ||
+              (['before', 'after'].includes(body.placement) ? body.anchorPageId : null);
+            if ((body.placement === 'before' || body.placement === 'after') && !targetId)
+              throw failure('invalid_request', 'Select an insertion anchor.');
+            if (
+              targetId &&
+              !(
+                await client.query(
+                  'SELECT 1 FROM pages WHERE id=$1 AND batch_id=$2 AND NOT replacement_candidate',
+                  [targetId, id],
+                )
+              ).rowCount
+            )
+              throw failure('invalid_request', 'The selected page does not belong to this batch.');
             const document = (
               await client.query(
                 'SELECT id FROM documents WHERE batch_id=$1 ORDER BY document_index LIMIT 1',
@@ -389,6 +483,19 @@ export function batchOperations(
               ],
             );
             await bump(client, id);
+            await client.query(
+              `UPDATE scan_sessions SET insertion_anchor=$2,insertion_side=$3,replacement_target=$4,
+              replacement_status=CASE WHEN $4::uuid IS NULL THEN NULL ELSE 'pending' END,
+              display_order_base=greatest(coalesce((SELECT max(display_order) FROM pages WHERE batch_id=$5),0),
+                coalesce((SELECT max(display_order_base+captured_file_count) FROM scan_sessions WHERE batch_id=$5 AND id<>$1),0)) WHERE id=$1`,
+              [
+                sessionId,
+                body.anchorPageId || null,
+                ['before', 'after'].includes(body.placement) ? body.placement : null,
+                body.replacementPageId || null,
+                id,
+              ],
+            );
             await audit(
               client,
               user,
@@ -472,8 +579,8 @@ export function batchOperations(
             const order = current.capture_order_base + file.number;
             added++;
             await client.query(
-              `INSERT INTO pages(batch_id,document_id,scan_session_id,capture_order,display_order,original_storage_key,active_storage_key,mime_type,byte_size,sha256,width_px,height_px,dpi,source)
-              VALUES($1,$2,$3,$4,$4,$5,$5,'image/png',$6,$7,$8,$9,$10,$11)`,
+              `INSERT INTO pages(batch_id,document_id,scan_session_id,capture_order,display_order,original_storage_key,active_storage_key,mime_type,byte_size,sha256,width_px,height_px,dpi,source,replacement_candidate,is_excluded)
+              VALUES($1,$2,$3,$4,$13,$5,$5,'image/png',$6,$7,$8,$9,$10,$11,$12,$12)`,
               [
                 session.batch_id,
                 session.document_id,
@@ -486,6 +593,8 @@ export function batchOperations(
                 file.height,
                 file.dpi,
                 session.scanner_mode,
+                !!current.replacement_target,
+                current.display_order_base + file.number,
               ],
             );
           }
@@ -529,6 +638,43 @@ export function batchOperations(
           );
           if (added || current.status !== status || current.recovery_pending)
             await bump(client, session.batch_id);
+          if (
+            ended &&
+            current.status === 'running' &&
+            current.insertion_anchor &&
+            current.insertion_side
+          ) {
+            const ordered = (
+              await client.query(
+                'SELECT id,scan_session_id FROM pages WHERE batch_id=$1 ORDER BY display_order,capture_order',
+                [session.batch_id],
+              )
+            ).rows;
+            const captured = ordered
+              .filter((p) => p.scan_session_id === session.id)
+              .map((p) => p.id);
+            const ids = ordered.filter((p) => p.scan_session_id !== session.id).map((p) => p.id);
+            const at = ids.indexOf(current.insertion_anchor);
+            if (at < 0) throw failure('invalid_request', 'Insertion anchor no longer exists.', 409);
+            ids.splice(at + (current.insertion_side === 'after' ? 1 : 0), 0, ...captured);
+            await client.query(
+              'UPDATE pages p SET display_order=x.n FROM unnest($1::uuid[]) WITH ORDINALITY x(id,n) WHERE p.id=x.id',
+              [ids],
+            );
+            await audit(
+              client,
+              { id: session.created_by },
+              'page.inserted',
+              'scan_session',
+              session.id,
+              {
+                anchorPageId: current.insertion_anchor,
+                side: current.insertion_side,
+                pages: captured.length,
+              },
+              session.batch_id,
+            );
+          }
           if (ended && (current.status === 'running' || current.recovery_pending))
             await audit(
               client,
@@ -565,7 +711,11 @@ export function batchOperations(
     async editPage(user, id, body) {
       uuid(id);
       keys(body, ['version', 'action']);
-      if (!['rotate-left', 'rotate-right', 'remove', 'restore'].includes(body.action))
+      if (
+        !['rotate-left', 'rotate-right', 'reset-rotation', 'remove', 'restore'].includes(
+          body.action,
+        )
+      )
         throw failure('invalid_request', 'Choose a valid page action.');
       let batchId;
       await transaction(pool, async (client) => {
@@ -577,16 +727,22 @@ export function batchOperations(
         ).rows[0];
         ownership(user, batch, true);
         mutable(batch);
+        await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, batchId);
         const page = (await client.query('SELECT * FROM pages WHERE id=$1 FOR UPDATE', [id]))
           .rows[0];
-        const rotating = body.action.startsWith('rotate-');
+        if (page.replacement_candidate)
+          throw failure('replacement_pending', 'Confirm or cancel this replacement first.', 409);
+        const rotating = body.action.startsWith('rotate-') || body.action === 'reset-rotation';
         if (rotating && page.is_excluded)
           throw failure('page_removed', 'Restore this page before rotating it.', 409);
-        const rotation = rotating
-          ? (page.rotation_degrees + (body.action === 'rotate-right' ? 90 : 270)) % 360
-          : page.rotation_degrees;
+        const rotation =
+          body.action === 'reset-rotation'
+            ? 0
+            : rotating
+              ? (page.rotation_degrees + (body.action === 'rotate-right' ? 90 : 270)) % 360
+              : page.rotation_degrees;
         const excluded = rotating ? page.is_excluded : body.action === 'remove';
         if (rotation === page.rotation_degrees && excluded === page.is_excluded) return;
         await client.query(
@@ -605,6 +761,126 @@ export function batchOperations(
         );
       });
       return api.get(user, batchId);
+    },
+    async replacement(user, id, body) {
+      uuid(id);
+      keys(body, ['version', 'sessionId', 'candidateId', 'cancel']);
+      uuid(body.sessionId);
+      if (body.cancel !== undefined && typeof body.cancel !== 'boolean')
+        throw failure('invalid_request', 'cancel must be boolean.');
+      await transaction(pool, async (client) => {
+        const batch = (
+          await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
+        ).rows[0];
+        ownership(user, batch, true);
+        mutable(batch);
+        await operatorEdit(client, user, batch);
+        version(batch, body.version);
+        await noRunning(client, id);
+        const session = (
+          await client.query(
+            "SELECT * FROM scan_sessions WHERE id=$1 AND batch_id=$2 AND replacement_status='pending' FOR UPDATE",
+            [body.sessionId, id],
+          )
+        ).rows[0];
+        if (!session) throw failure('conflict', 'Replacement is no longer pending.', 409);
+        if (!body.cancel) {
+          uuid(body.candidateId);
+          const candidate = (
+            await client.query(
+              'SELECT * FROM pages WHERE id=$1 AND scan_session_id=$2 AND replacement_candidate',
+              [body.candidateId, session.id],
+            )
+          ).rows[0];
+          if (!candidate)
+            throw failure('invalid_request', 'Explicitly choose a captured replacement candidate.');
+          await storage.validate(candidate);
+          await client.query(
+            `INSERT INTO page_revisions(page_id,storage_key,sha256,created_by,metadata)
+            VALUES($1,$2,$3,$4,$5)`,
+            [
+              session.replacement_target,
+              candidate.original_storage_key,
+              candidate.sha256,
+              user.id,
+              { candidatePageId: candidate.id, sessionId: session.id },
+            ],
+          );
+          await client.query(
+            'UPDATE pages SET active_storage_key=$2,rotation_degrees=0,updated_at=now() WHERE id=$1',
+            [session.replacement_target, candidate.original_storage_key],
+          );
+          await client.query('UPDATE pages SET replaced_by_page_id=$2 WHERE id=$1', [
+            session.replacement_target,
+            candidate.id,
+          ]);
+          // The chosen candidate remains excluded provenance; retain all other feeder images as ordinary pages.
+          await client.query(
+            'UPDATE pages SET replacement_candidate=false,is_excluded=false WHERE scan_session_id=$1 AND id<>$2',
+            [session.id, candidate.id],
+          );
+        } else
+          await client.query(
+            'UPDATE pages SET replacement_candidate=false WHERE scan_session_id=$1',
+            [session.id],
+          );
+        await client.query('UPDATE scan_sessions SET replacement_status=$2 WHERE id=$1', [
+          session.id,
+          body.cancel ? 'cancelled' : 'confirmed',
+        ]);
+        await bump(client, id);
+        await audit(
+          client,
+          user,
+          body.cancel ? 'page.replacement_cancelled' : 'page.replaced',
+          'page',
+          session.replacement_target,
+          { sessionId: session.id, candidatePageId: body.candidateId || null },
+          id,
+        );
+      });
+      return api.get(user, id);
+    },
+    async reorder(user, id, body) {
+      uuid(id);
+      keys(body, ['version', 'pageId', 'beforePageId']);
+      uuid(body.pageId);
+      await transaction(pool, async (client) => {
+        const batch = (
+          await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
+        ).rows[0];
+        ownership(user, batch, true);
+        mutable(batch);
+        await operatorEdit(client, user, batch);
+        version(batch, body.version);
+        await noRunning(client, id);
+        const ids = (
+          await client.query(
+            'SELECT id FROM pages WHERE batch_id=$1 ORDER BY display_order,capture_order',
+            [id],
+          )
+        ).rows.map((p) => p.id);
+        if (!ids.includes(body.pageId)) throw failure('invalid_request', 'Page not found.');
+        ids.splice(ids.indexOf(body.pageId), 1);
+        const at = body.beforePageId == null ? ids.length : ids.indexOf(uuid(body.beforePageId));
+        if (at < 0) throw failure('invalid_request', 'Destination page not found.');
+        ids.splice(at, 0, body.pageId);
+        await client.query(
+          'UPDATE pages p SET display_order=x.n FROM unnest($1::uuid[]) WITH ORDINALITY x(id,n) WHERE p.id=x.id',
+          [ids],
+        );
+        await bump(client, id);
+        await audit(
+          client,
+          user,
+          'page.reordered',
+          'page',
+          body.pageId,
+          { beforePageId: body.beforePageId },
+          id,
+        );
+      });
+      return api.get(user, id);
     },
     async page(user, id) {
       uuid(id);

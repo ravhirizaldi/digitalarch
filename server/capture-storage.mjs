@@ -9,8 +9,13 @@ import { failure } from './errors.mjs';
 export function captureStorage(root) {
   root = path.resolve(root);
   let queue = Promise.resolve();
+  let closed = false;
   const pending = new Map();
   const serial = (operation) => {
+    if (closed)
+      return Promise.reject(
+        failure('storage_closed', 'Storage is closing; captured source files are retained.', 503),
+      );
     const work = queue.then(operation);
     queue = work.catch(() => {});
     return work;
@@ -57,6 +62,11 @@ export function captureStorage(root) {
   return {
     root,
     open,
+    async close() {
+      closed = true;
+      await Promise.allSettled([...pending.values()]);
+      await queue;
+    },
     async ocrImage(page) {
       const buffer = await read(await open(page.storage_key));
       const info = await inspect(buffer);

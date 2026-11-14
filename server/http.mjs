@@ -11,7 +11,12 @@ async function readBody(req) {
   let length = 0;
   for await (const chunk of req) {
     length += chunk.length;
-    if (length > 16 * 1024) throw failure('invalid_request', 'Request body too large.', 413);
+    const max = /\/correct-text$/.test(req.url)
+      ? 4 * 1024 * 1024
+      : /\/metadata(?:\/extract)?$/.test(req.url)
+        ? 1024 * 1024
+        : 64 * 1024;
+    if (length > max) throw failure('invalid_request', 'Request body too large.', 413);
     chunks.push(chunk);
   }
   try {

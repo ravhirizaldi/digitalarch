@@ -51,28 +51,37 @@ The last two SELECTs are executed by `pnpm db:status` through the actual WSL Nod
 
 ## Schema
 
-All entity primary keys are UUIDs. Timestamps are TIMESTAMPTZ, stored in UTC and displayed in Asia/Jakarta.
+Most entity primary keys are UUIDs. Join/review tables have composite keys, `document_metadata` is keyed by its OCR job UUID, `ocr_defaults` uses a Boolean singleton key, login throttling uses a username key, and `schema_migrations` uses a migration-name key. Timestamps are TIMESTAMPTZ, stored in UTC and displayed in Asia/Jakarta.
 
-| Table                 | Important relationships / rules                                                                                                   |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `schema_migrations`   | Checksummed version ledger                                                                                                        |
-| `users`               | Case-insensitive unique username, Argon2id hash, active/forced-change flags, account version                                      |
-| `roles`               | Six stable role codes                                                                                                             |
-| `permissions`         | Permission codes; no implicit superuser operational privileges                                                                    |
-| `user_roles`          | User ↔ role many-to-many                                                                                                          |
-| `role_permissions`    | Role ↔ permission many-to-many                                                                                                    |
-| `auth_sessions`       | User, token hash, CSRF hash, fixed expiry, revocation                                                                             |
-| `auth_login_attempts` | Persisted per-username 15-minute failed-login window                                                                              |
-| `archive_batches`     | Creator/assigned user, generated unique code, nonunique optional location, explicit status and version                            |
-| `documents`           | Batch → many logical documents; unique `(batch_id,document_index)`, initially one empty placeholder                               |
-| `scan_sessions`       | Batch + document + operator, sequential number, scanner snapshot/job reference, status/count/error; one running session per batch |
-| `pages`               | Batch + document + session composite FK; immutable capture order/original key/hash/source; independent display order/active key   |
-| `page_revisions`      | Future replacement history for a logical page; no current replacement API                                                         |
-| `audit_logs`          | Actor, action, entity, optional batch, non-sensitive metadata, correlation UUID; append-only trigger                              |
-| `ocr_jobs`            | Batch snapshot, persistent status/counters/configuration, unique manifest/language, lease token/expiry and version                |
-| `page_ocr_results`    | Job/page/batch composite FKs, image checksum/revision/rotation, text/bounds/errors/timing, attempts and exact-result reuse link   |
+See [ERD.md](ERD.md) for Mermaid diagrams of the source schema through migration 011, including composite/nullable references and JSON fields that are not SQL FKs. [DND.md](DND.md) explains versions/transaction boundaries; [DFD.md](DFD.md) shows data movement. These are source-derived, not a new live-schema verification.
 
-Foreign keys have no cascade-delete path for documents/pages. Unique indexes protect batch codes, session numbering, original storage keys and feeder order. A trigger rejects deletion or mutation of original page provenance. Application operations prohibit cancelling any batch with captured pages, including removed ones. Basic operator corrections use the existing `rotation_degrees` and `is_excluded` columns; no new migration or image rewrite is required. Page revisions and formal QC remain future work.
+| Table                         | Important relationships / rules                                                                                                   |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `schema_migrations`           | Checksummed version ledger                                                                                                        |
+| `users`                       | Case-insensitive unique username, Argon2id hash, active/forced-change flags, account version                                      |
+| `roles`                       | Six stable role codes                                                                                                             |
+| `permissions`                 | Permission codes; no implicit superuser operational privileges                                                                    |
+| `user_roles`                  | User ↔ role many-to-many                                                                                                          |
+| `role_permissions`            | Role ↔ permission many-to-many                                                                                                    |
+| `auth_sessions`               | User, token hash, CSRF hash, fixed expiry, revocation                                                                             |
+| `auth_login_attempts`         | Persisted per-username 15-minute failed-login window                                                                              |
+| `archive_batches`             | Creator/assigned user, generated unique code, nonunique optional location, explicit status and version                            |
+| `documents`                   | One active logical document per batch in this phase; metadata, document version/revision, workflow status and review cycle        |
+| `scan_sessions`               | Batch + document + operator, sequential number, scanner snapshot/job reference, status/count/error; one running session per batch |
+| `pages`                       | Batch + document + session composite FK; immutable capture order/original key/hash/source; independent display order/active key   |
+| `page_revisions`              | Recorded replacement image/hash/rotation and immutable candidate/session provenance for a logical page                            |
+| `audit_logs`                  | Actor, action, entity, optional batch, bounded event metadata/reasons and correlation UUID; append-only trigger; private data     |
+| `ocr_jobs`                    | Batch snapshot, status/counters/configuration, unique batch/manifest/language/config/request identity, lease token/expiry/version |
+| `ocr_defaults`                | Singleton language/processing defaults, version and updating actor; jobs retain their own immutable configuration snapshots       |
+| `page_ocr_results`            | Job/page/batch composite FKs, image checksum/revision/rotation, text/bounds/errors/timing, attempts and exact-result reuse link   |
+| `document_metadata`           | Historical per-OCR-run metadata snapshots; read-only through HTTP in Phase 4                                                      |
+| `document_metadata_revisions` | Append-only document metadata saves/extractions/adoption with actor and version                                                   |
+| `qc_reviews`                  | Unique document/cycle, exclusive expiring claim, checklist, decision and reviewed-revision snapshot                               |
+| `qc_page_reviews`             | Per-cycle page status and reviewed image generation                                                                               |
+| `qc_findings`                 | Document/page/field findings, severity, resolution/waiver and originating review                                                  |
+| `ocr_text_corrections`        | Append-only human text corrections, separate from original OCR results                                                            |
+
+Foreign keys have no cascade-delete path for documents/pages. Unique indexes protect batch codes, session numbering, original storage keys and feeder order. A trigger rejects deletion or mutation of original page provenance. Application operations prohibit cancelling any batch with captured pages, including removed ones. Corrections use rotation/exclusion/order or a new active image reference, never an overwrite of original bytes. A separate trigger blocks page insertion/update after QC Pass.
 
 `PATCH /api/pages/:id` requires `batches:update`, ownership, a mutable batch, its current version, valid CSRF and no running/reconciling session. Rotation wraps in 90-degree steps; removal/restore only changes exclusion state. Changes bump the batch version and append `page.rotated`, `page.removed` or `page.restored` audit records in the same transaction. Batch counts include retained pages only; scan-session counts preserve the original feeder result. Completion requires at least one retained page and still verifies every original. Removed files remain accessible to authorized owners and recoverable through the UI.
 
@@ -82,13 +91,23 @@ Foreign keys have no cascade-delete path for documents/pages. Unique indexes pro
 
 `004_ocr_processing.sql` adds the OCR tables, queue/lease/page indexes, current-image checksum validation, stale-result trigger, `queue_batch_ocr` function and four OCR permissions. Capture state stays `capture_completed`; `archive_batches.ocr_status` separately records preparation/processing state without unlocking capture or adding QC transitions. Completion and enqueue share one transaction. `005_ocr_revision_generation.sql` adds monotonic image-revision generations so returning to identical bytes queues a new snapshot rather than reviving a stale job; a unique index permits only one processing page per job. Applied migrations are unchanged.
 
-The queue locks a job using `FOR UPDATE SKIP LOCKED`, commits a UUID lease, then processes outside the transaction. Heartbeats renew live leases; expired claims are recovered with bounded attempt accounting. Result writes require the matching unexpired token. Every page result and progress update commits independently. Successful source/config identities have a partial unique index; later jobs reference an existing exact result rather than inserting another successful extraction. The identity includes SHA-256, engine/version and binary hash, language-file hashes, SDK/mode and explicit rotation. Old revision results remain stored and marked stale. There is no page replacement API in this phase; integrity/scheduling hooks support the existing revision schema and are tested via recorded revisions.
+The queue locks a job using `FOR UPDATE SKIP LOCKED`, commits a UUID lease, then processes outside the transaction. Heartbeats renew live leases; expired claims are recovered with bounded attempt accounting. Result writes require the matching unexpired token. Every page result and progress update commits independently. Successful source/config identities have a partial unique index; later jobs reference an existing exact result rather than inserting another successful extraction. The identity includes SHA-256, engine/version and binary hash, language-file hashes, SDK/mode and explicit rotation. Old revision results remain stored and marked stale. Phase 4 replacement/rotation uses this same invalidation and queue, not a second worker.
 
 `006_ocr_profiles.sql` adds `ocr_jobs.processing_config` and an idempotent request key, extending the existing queue identity for history-preserving reprocessing. Earlier Fast results are labelled legacy, not rewritten. New configuration snapshots include profile, Best data, PSM 3/4/6, preprocessing/version and DPI. Source/job relationships, leases and the database architecture remain the same. Benchmark mode uses ordinary jobs, not a second processing service. See [OCR.md](OCR.md).
 
 `007_ocr_engines.sql` adds a constraint for explicit `paddleocr` / `PP-OCRv6 Small` processing-version-3 configurations and insert-only triggers to snapshot the engine label on new jobs/page placeholders. It does not modify historical Tesseract rows/configuration identities. Existing queue functions, job leases, per-page results, exact-success cache, request idempotency and ownership are reused by the unified adapter. Omitting the engine retains the old Tesseract configuration identity. No new table, database, Redis or Docker image is introduced.
 
 `008_ocr_global_settings.sql` adds the single-row `ocr_defaults` table (language, processing JSON, optimistic-concurrency version, updated time/actor), System Administrator `settings:read` / `settings:manage` permissions, and validation for processing-version-4 PaddleOCR budgets of 1/2/4 CPU threads. Existing version-3 jobs retain an implicit one-thread budget. `queue_batch_ocr` resolves omitted language/configuration from the singleton row in the enqueue transaction; explicit snapshots are unchanged. The backend seeds the row from existing environment settings only when no row exists. Changing defaults does not update, restart or reprocess old jobs. Saves are version-checked and audited as `ocr.settings_updated`. No additional database/service/image is introduced.
+
+`009_document_metadata.sql` stores versioned per-run rule extraction. `010_quality_control.sql` extends the existing document, session and page records and adds the QC/metadata/text-history tables above. Capture completion creates a review cycle and sets `workflow_status='preparing'`; terminal OCR enables rule extraction and `qc_waiting`. Return sets the same capture batch to paused and document to `rework`; resubmission creates another cycle. Capture status and OCR status remain independent. Existing nondeleted completed batches are backfilled to their first preparing cycle; they still require explicit OCR enqueue if no OCR job exists.
+
+Migration 010 also reserves `scan_sessions.display_order_base` independently of immutable feeder order, records insertion anchors/replacement targets and candidates, and wraps the existing OCR enqueue function to reject new jobs after QC Pass. QC mutations lock batch → document → review, require current versions and a live owner claim, and renew a 30-minute lease. Pass rejects active OCR jobs, checks original/active files and stores metadata, ordered page/image identities and effective OCR/correction IDs in the cycle snapshot. Current metadata and ordinary OCR/page mutations are then locked at `awaiting_approval_l1`.
+
+`011_metadata_continuity.sql` adopts the latest saved per-run metadata into the current document once. Current manual/corrected fields win over the same legacy field context; legacy rows are retained unchanged. Adoption creates a metadata revision and count/version-only audit record. It also changes the initial metadata status to `not_extracted`. Migration 010 has already been applied locally; never edit its checksum. Apply new migration files before loading the corresponding backend code, not after queries begin failing.
+
+### Approval extension boundary
+
+The current `documents.workflow_status` CHECK permits only `capturing`, `preparing`, `qc_waiting`, `qc_in_review`, `rework` and `awaiting_approval_l1`. Approval-decision tables, L2/final states and archive-role read APIs do not exist yet. Current database page/OCR guards explicitly check `awaiting_approval_l1`; new states must extend those protections in a **new forward migration**, alongside matching application guards. Do not add a status value and accidentally make approved content editable. [APPROVAL.md](APPROVAL.md) describes the proposed model and unresolved rejection/access policies, separately from the actual ERD.
 
 ## Authentication and permission policy
 
@@ -99,13 +118,13 @@ Session tokens: 32 random bytes in an HttpOnly, SameSite=Strict cookie; database
 | Role             | Granted permission groups                                                                                                    |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `operator`       | Assigned-batch create/read/update/resume/pause/complete/delete; scanner read/scan/configure; assigned OCR read/manage        |
-| `qc_officer`     | QC read/review/submit/return + scanner capabilities for the future phase; no current batch-capture ownership bypass          |
+| `qc_officer`     | QC read/review/submit/return, all-batch/OCR read; no capture assignment or self-QC bypass                                    |
 | `approver_l1`    | L1 review/approve/reject, future only                                                                                        |
 | `approver_l2`    | L2 review/approve/reject, future only                                                                                        |
 | `archive_viewer` | Archive read/search, future only                                                                                             |
-| `system_admin`   | Users, roles, batch read-all/reassign, audit, system info and explicit OCR read/manage-all; **no scanner/QC/approval grant** |
+| `system_admin`   | Users, roles, batch oversight/reassign, audit, settings, OCR oversight, QC read/reassign/configure; **no QC decision grant** |
 
-Role assignment prevents combining L1/L2, or either approval role with Operator/QC. Administrator and explicit operational roles may coexist. Formal per-document approval/creator separation must be added with the actual future workflows; no approval/QC bypass exists now because those APIs do not exist.
+Role assignment prevents combining L1/L2, or either approval role with Operator/QC. Administrator and explicit operational roles may coexist. QC denies the batch creator, assigned operator and every scan-session creator regardless of combined administrative roles. Administrator claim release requires a reason and does not grant review authority. Approval APIs remain out of scope.
 
 `pnpm admin:bootstrap` refuses if any administrator role assignment exists, even if disabled. Preserve existing installation accounts; never reset them as part of setup. A fresh installation has no built-in default login and must bootstrap interactively. Rotate demonstration credentials before deployment.
 

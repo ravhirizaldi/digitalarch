@@ -12,9 +12,46 @@ import {
   Tabs,
   Tag,
 } from 'antd';
-import { PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons';
+import {
+  CalendarOutlined,
+  ClearOutlined,
+  ClockCircleOutlined,
+  FileImageOutlined,
+  FileTextOutlined,
+  FolderOpenOutlined,
+  EnvironmentOutlined,
+  PlusOutlined,
+  ScanOutlined,
+  SearchOutlined,
+  TagsOutlined,
+  UserOutlined,
+} from '@ant-design/icons';
 import { api } from './api';
-import { dateTime } from './ui';
+import { dateTime, IconButton } from './ui';
+import WorklistTable, { BatchIdentity, ColumnHeading } from './WorklistTable';
+import { queryChoice, queryPage, useUrlState } from './useUrlState';
+
+function readBatchState(params) {
+  const size = Number(queryChoice(params, 'size', ['25', '50', '100']));
+  return {
+    status: queryChoice(params, 'status', ['in_progress', 'paused', 'capture_completed']),
+    q: (params.get('q') || '').slice(0, 240),
+    page: Math.min(queryPage(params, 'page'), Math.floor(1_000_000 / size) + 1),
+    size,
+    sort: queryChoice(params, 'sort', [
+      'updated_at',
+      'created_at',
+      'batch_code',
+      'physical_location',
+      'page_count',
+      'session_count',
+      'status',
+      'assigned_operator',
+    ]),
+    direction: queryChoice(params, 'direction', ['desc', 'asc']),
+    activity: params.get('activity') === '1',
+  };
+}
 
 const activityLabels = {
   'batch.created': 'Batch created',
@@ -35,18 +72,6 @@ const activityLabels = {
   'page.restored': 'Page restored',
 };
 
-export function useTableHeight() {
-  const region = useRef(null);
-  const [height, setHeight] = useState(250);
-  useEffect(() => {
-    const observer = new ResizeObserver(([entry]) =>
-      setHeight(Math.max(80, entry.contentRect.height - 110)),
-    );
-    if (region.current) observer.observe(region.current);
-    return () => observer.disconnect();
-  }, []);
-  return [region, height];
-}
 export const batchStatus = (value) => (
   <Tag
     color={
@@ -61,43 +86,60 @@ export default function BatchList({
   home,
   onNew,
   onOpen,
+  onDocument,
   creating,
   userId,
   administrative = false,
 }) {
-  const [result, setResult] = useState({ batches: [], total: 0, activity: [] });
-  const [status, setStatus] = useState('in_progress');
-  const [search, setSearch] = useState('');
-  const [page, setPage] = useState(1);
+  const [result, setResult] = useState({
+    batches: [],
+    total: 0,
+    pages: 0,
+    sessions: 0,
+    activity: [],
+  });
+  const [query, setQuery] = useUrlState(readBatchState);
+  const { status, q: search, page, size: pageSize, sort, direction, activity } = query;
+  const requestId = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [operators, setOperators] = useState([]);
   const [assignments, setAssignments] = useState({});
-  const [region, height] = useTableHeight();
   const load = useCallback(async () => {
+    const request = ++requestId.current;
     setLoading(true);
     try {
-      setResult(
-        await api(
-          `/api/batches?status=${status}&search=${encodeURIComponent(search)}&offset=${(page - 1) * 25}`,
-        ),
+      const next = await api(
+        `/api/batches?${new URLSearchParams({ status, search, sort, direction, limit: String(pageSize), offset: String((page - 1) * pageSize) })}`,
       );
+      if (request !== requestId.current) return;
+      const lastPage = Math.max(1, Math.ceil(next.total / pageSize));
+      if (page > lastPage) {
+        setQuery({ page: lastPage }, { replace: true });
+        return;
+      }
+      setResult(next);
       setError('');
-      if (administrative)
-        setOperators(
-          (await api('/api/admin/users')).users.filter(
-            (user) => user.is_active && user.roles.includes('operator'),
-          ),
-        );
+      if (administrative) {
+        const accounts = (await api('/api/admin/users')).users;
+        if (request === requestId.current)
+          setOperators(
+            accounts.filter((user) => user.is_active && user.roles.includes('operator')),
+          );
+      }
     } catch (error) {
-      setError(error.message);
+      if (request === requestId.current) setError(error.message);
     } finally {
-      setLoading(false);
+      if (request === requestId.current) setLoading(false);
     }
-  }, [status, search, page, administrative]);
+  }, [status, search, page, pageSize, sort, direction, administrative, setQuery]);
   useEffect(() => {
+    const requests = requestId;
     const timer = setTimeout(load, 200);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      requests.current++;
+    };
   }, [load]);
   async function reassign(batch) {
     setLoading(true);
@@ -116,12 +158,7 @@ export default function BatchList({
     setLoading(true);
     try {
       await api(`/api/batches/${batch.id}/delete`, { version: batch.version });
-      setResult((current) => ({
-        ...current,
-        batches: current.batches.filter((item) => item.id !== batch.id),
-        total: Math.max(0, current.total - 1),
-      }));
-      if (result.batches.length === 1 && page > 1) setPage(page - 1);
+      if (result.batches.length === 1 && page > 1) setQuery({ page: page - 1 }, { replace: true });
       else await load();
     } catch (error) {
       setError(error.message);
@@ -129,35 +166,73 @@ export default function BatchList({
       setLoading(false);
     }
   }
+  const heading = (icon, text) => <ColumnHeading icon={icon}>{text}</ColumnHeading>;
+  const sortable = (key) => ({
+    key,
+    sorter: true,
+    sortOrder: sort === key ? (direction === 'asc' ? 'ascend' : 'descend') : null,
+  });
   const columns = [
-    { title: 'Batch ID', dataIndex: 'batch_code', width: 230, ellipsis: true },
     {
-      title: 'Physical location',
+      ...sortable('batch_code'),
+      title: heading(<FileTextOutlined aria-hidden />, 'Batch'),
+      dataIndex: 'batch_code',
+      width: 270,
+      render: (value) => <BatchIdentity value={value}>{value}</BatchIdentity>,
+    },
+    {
+      ...sortable('physical_location'),
+      title: heading(<EnvironmentOutlined aria-hidden />, 'Location'),
       dataIndex: 'physical_location',
       width: 140,
       ellipsis: true,
       render: (value) => value || '—',
     },
     {
-      title: 'Pages',
+      ...sortable('page_count'),
+      title: heading(<FileImageOutlined aria-hidden />, 'Pages'),
       dataIndex: 'page_count',
-      width: 70,
+      width: 88,
       align: 'right',
-      sorter: (a, b) => a.page_count - b.page_count,
     },
-    { title: 'Sessions', dataIndex: 'session_count', width: 80, align: 'right' },
     {
-      title: 'Last activity · WIB',
+      ...sortable('session_count'),
+      title: heading(<ScanOutlined aria-hidden />, 'Sessions'),
+      dataIndex: 'session_count',
+      width: 110,
+      align: 'right',
+    },
+    {
+      ...sortable('created_at'),
+      title: heading(<CalendarOutlined aria-hidden />, 'Created'),
+      dataIndex: 'created_at',
+      width: 150,
+      render: dateTime,
+    },
+    {
+      ...sortable('updated_at'),
+      title: heading(<ClockCircleOutlined aria-hidden />, 'Activity'),
       dataIndex: 'updated_at',
       width: 165,
       render: dateTime,
-      sorter: (a, b) => a.updated_at.localeCompare(b.updated_at),
     },
-    { title: 'Status', dataIndex: 'status', width: 120, render: batchStatus },
-    { title: 'Assigned operator', dataIndex: 'assigned_operator', width: 130, ellipsis: true },
     {
-      title: 'Action',
-      width: administrative ? 290 : 160,
+      ...sortable('status'),
+      title: heading(<TagsOutlined aria-hidden />, 'Status'),
+      dataIndex: 'status',
+      width: 140,
+      render: batchStatus,
+    },
+    {
+      ...sortable('assigned_operator'),
+      title: heading(<UserOutlined aria-hidden />, 'Operator'),
+      dataIndex: 'assigned_operator',
+      width: 130,
+      ellipsis: true,
+    },
+    {
+      title: heading(<FolderOpenOutlined aria-hidden />, 'Actions'),
+      width: administrative ? 290 : 240,
       fixed: 'right',
       render: (_, batch) =>
         administrative ? (
@@ -176,6 +251,15 @@ export default function BatchList({
           </Space>
         ) : (
           <Space size={4}>
+            {onDocument && (
+              <Button
+                type="link"
+                disabled={creating || loading}
+                onClick={() => onDocument(batch.id)}
+              >
+                {batch.workflow_status === 'rework' ? 'QC findings' : 'Metadata / QC'}
+              </Button>
+            )}
             <Button type="link" disabled={creating || loading} onClick={() => onOpen(batch)}>
               {batch.status === 'capture_completed' ? 'View details' : 'Resume'}
             </Button>
@@ -203,7 +287,7 @@ export default function BatchList({
       className="workspace"
       aria-label={administrative ? 'Batch assignments' : home ? 'Capture Workspace' : 'My Batches'}
     >
-      <div className="workspace-toolbar">
+      <div className="workspace-toolbar worklist-filters">
         <h1>{administrative ? 'Batch assignments' : home ? 'Capture Workspace' : 'My Batches'}</h1>
         {!administrative && (
           <Button
@@ -221,23 +305,36 @@ export default function BatchList({
           prefix={<SearchOutlined />}
           placeholder="Batch code or physical location"
           value={search}
+          maxLength={240}
           allowClear
           onChange={(event) => {
-            setSearch(event.target.value);
-            setPage(1);
+            setQuery({ q: event.target.value, page: 1 }, { replace: true });
           }}
+          onPressEnter={load}
         />
         <span className="toolbar-spacer" />
-        <Button icon={<ReloadOutlined aria-hidden />} loading={loading} onClick={load}>
-          Refresh
+        <Button icon={<SearchOutlined aria-hidden />} loading={loading} onClick={load}>
+          Search
         </Button>
+        <IconButton
+          label="Clear filters"
+          icon={<ClearOutlined aria-hidden />}
+          onClick={() =>
+            setQuery({
+              q: '',
+              status: 'in_progress',
+              sort: 'updated_at',
+              direction: 'desc',
+              page: 1,
+            })
+          }
+        />
       </div>
       {error && <Alert type="error" showIcon title={error} />}
       <Tabs
         activeKey={status}
         onChange={(value) => {
-          setStatus(value);
-          setPage(1);
+          setQuery({ status: value, page: 1 });
         }}
         items={['in_progress', 'paused', 'capture_completed'].map((key) => ({
           key,
@@ -248,37 +345,48 @@ export default function BatchList({
           }[key],
         }))}
       />
-      <div className="registry-table-region" ref={region}>
-        <Table
-          className="batch-table"
-          style={{ '--batch-table-body-height': `${height}px` }}
-          size="small"
-          rowKey="id"
-          loading={loading}
-          dataSource={result.batches}
-          columns={columns}
-          scroll={{ x: administrative ? 1300 : 1100, y: height }}
-          pagination={{
-            current: page,
-            pageSize: 25,
-            total: result.total,
-            showSizeChanger: false,
-            onChange: setPage,
-          }}
-          locale={{
-            emptyText: (
-              <Empty
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description="No batches in this status. Create a batch or choose another tab."
-              />
-            ),
-          }}
-        />
-      </div>
+      <WorklistTable
+        size="small"
+        rowKey="id"
+        loading={loading}
+        dataSource={result.batches}
+        columns={columns}
+        scroll={{ x: administrative ? 1500 : 1400 }}
+        totals={[
+          { label: 'batches', value: result.total, icon: <FileTextOutlined aria-hidden /> },
+          { label: 'pages', value: result.pages, icon: <FileImageOutlined aria-hidden /> },
+          { label: 'sessions', value: result.sessions, icon: <ScanOutlined aria-hidden /> },
+        ]}
+        onChange={(_pagination, _filters, next) =>
+          setQuery({
+            sort: next.order ? next.columnKey : 'updated_at',
+            direction: next.order === 'ascend' ? 'asc' : 'desc',
+            page: 1,
+          })
+        }
+        pagination={{
+          current: page,
+          pageSize,
+          total: result.total,
+          onChange: (next, size) => setQuery({ page: pageSize === size ? next : 1, size }),
+        }}
+        locale={{
+          emptyText: (
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description="No batches in this status. Create a batch or choose another tab."
+            />
+          ),
+        }}
+      />
       {home && (
         <section className="recent-activity" aria-label="Recent activity">
           <Collapse
             size="small"
+            activeKey={activity ? ['activity'] : []}
+            onChange={(keys) =>
+              setQuery({ activity: keys.includes('activity') }, { replace: true })
+            }
             items={[
               {
                 key: 'activity',
@@ -291,14 +399,14 @@ export default function BatchList({
                     dataSource={result.activity}
                     columns={[
                       {
-                        title: 'Event',
+                        title: heading(<TagsOutlined aria-hidden />, 'Event'),
                         dataIndex: 'action',
                         render: (action) =>
                           activityLabels[action] ||
                           action.replaceAll('.', ' ').replaceAll('_', ' '),
                       },
                       {
-                        title: 'Time · WIB',
+                        title: heading(<ClockCircleOutlined aria-hidden />, 'Time · WIB'),
                         dataIndex: 'created_at',
                         render: dateTime,
                         width: 180,

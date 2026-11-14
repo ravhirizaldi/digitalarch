@@ -39,6 +39,8 @@ import './style.css';
 const Administration = lazy(() => import('./Administration'));
 const OcrWorkspace = lazy(() => import('./OcrWorkspace'));
 const OcrSettings = lazy(() => import('./OcrSettings'));
+const QcWorkspace = lazy(() => import('./QcWorkspace'));
+const QcQueue = lazy(() => import('./QcWorkspace').then((module) => ({ default: module.QcQueue })));
 
 function DigitalArchApp() {
   const [identity, setIdentity] = useState(null);
@@ -47,7 +49,12 @@ function DigitalArchApp() {
   const [scanner, setScanner] = useState({});
   const [active, setActive] = useState(null);
   const [ocrJobId, setOcrJobId] = useState(null);
+  const [documentBatchId, setDocumentBatchId] = useState(null);
+  const [documentStatus, setDocumentStatus] = useState(null);
+  const [capturePageId, setCapturePageId] = useState(null);
+  const [ocrMetadataDirty, setOcrMetadataDirty] = useState(false);
   const activeId = useRef(null);
+  const currentLocation = useRef(window.location.pathname + window.location.search);
   const navigatingHistory = useRef(false);
   const [working, setWorking] = useState('');
   const [requestedMode, setRequestedMode] = useState(null);
@@ -78,10 +85,41 @@ function DigitalArchApp() {
   }, []);
   const showView = useCallback((next, batchId = null, replace = false) => {
     if (next === 'ocr') setOcrJobId(batchId);
-    const pathname = routePath(next, batchId);
-    if (window.location.pathname !== pathname)
-      window.history[replace ? 'replaceState' : 'pushState'](null, '', pathname);
+    if (next === 'document') setDocumentBatchId(batchId);
+    const destination = new URL(routePath(next, batchId), window.location.origin);
+    if (
+      destination.pathname === window.location.pathname ||
+      (replace && matchRoute(window.location.pathname)?.view === next)
+    )
+      destination.search = window.location.search;
+    else if (
+      next === 'document' &&
+      ['/qc', '/batches', '/capture', '/admin/batches'].includes(window.location.pathname)
+    )
+      destination.searchParams.set('returnTo', window.location.pathname + window.location.search);
+    else {
+      const returnTo = new URLSearchParams(window.location.search).get('returnTo');
+      if (returnTo === destination.pathname || returnTo?.startsWith(destination.pathname + '?'))
+        destination.search = new URL(returnTo, window.location.origin).search;
+    }
+    if (
+      window.location.pathname + window.location.search !==
+      destination.pathname + destination.search
+    )
+      window.history[replace ? 'replaceState' : 'pushState'](
+        null,
+        '',
+        destination.pathname + destination.search,
+      );
+    currentLocation.current = destination.pathname + destination.search;
     setView(next);
+  }, []);
+  useEffect(() => {
+    const remember = () => {
+      currentLocation.current = window.location.pathname + window.location.search;
+    };
+    window.addEventListener('digitalarch:url-state', remember);
+    return () => window.removeEventListener('digitalarch:url-state', remember);
   }, []);
   const restoreRoute = useCallback(
     async (account, requested = matchRoute(window.location.pathname)) => {
@@ -107,7 +145,7 @@ function DigitalArchApp() {
           showView('scanner', result.batch.id, true);
         } else {
           clearBatch();
-          showView(route.view, route.jobId || null, true);
+          showView(route.view, route.jobId || route.documentBatchId || null, true);
         }
       } catch (error) {
         setError(error.message);
@@ -183,9 +221,20 @@ function DigitalArchApp() {
   useEffect(() => {
     if (!user || user.must_change_password) return;
     const pop = async () => {
-      const currentPath = routePath(view, view === 'ocr' ? ocrJobId : active?.batch.id);
+      const currentPath = currentLocation.current;
       if (busy || navigatingHistory.current) {
         window.history.pushState(null, '', currentPath);
+        window.dispatchEvent(new Event('digitalarch:url-state'));
+        return;
+      }
+      if (ocrMetadataDirty && !window.confirm('Discard unsaved metadata edits?')) {
+        window.history.pushState(null, '', currentPath);
+        window.dispatchEvent(new Event('digitalarch:url-state'));
+        return;
+      }
+      if (new URL(currentPath, window.location.origin).pathname === window.location.pathname) {
+        currentLocation.current = window.location.pathname + window.location.search;
+        window.dispatchEvent(new Event('digitalarch:url-state'));
         return;
       }
       const requested = matchRoute(window.location.pathname);
@@ -197,13 +246,14 @@ function DigitalArchApp() {
       } catch (error) {
         setError(error.message);
         window.history.pushState(null, '', currentPath);
+        window.dispatchEvent(new Event('digitalarch:url-state'));
       } finally {
         navigatingHistory.current = false;
       }
     };
     window.addEventListener('popstate', pop);
     return () => window.removeEventListener('popstate', pop);
-  }, [user, busy, active, locked, view, ocrJobId, restoreRoute]);
+  }, [user, busy, active, locked, view, ocrJobId, documentBatchId, ocrMetadataDirty, restoreRoute]);
 
   async function run(label, operation) {
     if (working) return;
@@ -219,14 +269,10 @@ function DigitalArchApp() {
     }
   }
   async function newBatch() {
-    await run('create', async () => {
-      const result = await api('/api/batches', {});
-      activeId.current = result.batch.id;
-      setActive(result);
-      showView('scanner', result.batch.id);
-    });
+    if (busy) return;
+    await leave('scanner');
   }
-  async function openBatch(batch) {
+  async function openBatch(batch, selectedPageId = null) {
     await run('resume', async () => {
       const result =
         batch.status === 'capture_completed'
@@ -235,32 +281,58 @@ function DigitalArchApp() {
       clearBatch();
       activeId.current = result.batch.id;
       setActive(result);
+      setCapturePageId(selectedPageId);
       showView('scanner', result.batch.id);
     });
   }
-  async function leave(next = 'home') {
+  async function leave(next = 'home', nextId = null) {
     await run('pause', async () => {
       if (active && !locked)
         await api(`/api/batches/${active.batch.id}/pause`, { version: active.batch.version });
       clearBatch();
-      showView(next);
+      showView(next, nextId);
     });
   }
   function navigate(next) {
     if (busy) return;
+    if (ocrMetadataDirty && !window.confirm('Discard unsaved metadata edits?')) return;
     if (active && next !== 'scanner') leave(next);
     else {
       setError('');
       showView(next, next === 'scanner' ? active?.batch.id : null);
     }
   }
+  function backFromDocument() {
+    const returnTo = new URLSearchParams(window.location.search).get('returnTo');
+    const origin = returnTo?.split('?')[0];
+    const route = ['/qc', '/batches', '/capture', '/admin/batches'].includes(origin)
+      ? permittedRoute(user, matchRoute(origin)).view
+      : can('qc:read')
+        ? 'qc'
+        : 'batches';
+    navigate(route);
+  }
   async function scannerAction(route, body = {}) {
     if (route === 'mode') setRequestedMode(body.mode);
     await run(route, async () => {
       if (route === 'scan') {
-        const result = await api(`/api/batches/${active.batch.id}/scan-sessions`, {
-          version: active.batch.version,
-          options: body,
+        let target = active;
+        if (!target) {
+          target = await api('/api/batches', {});
+          activeId.current = target.batch.id;
+          setActive(target);
+          showView('scanner', target.batch.id);
+        }
+        const result = await api(`/api/batches/${target.batch.id}/scan-sessions`, {
+          version: target.batch.version,
+          options: body.options || body,
+          ...(body.options
+            ? {
+                placement: body.placement,
+                anchorPageId: body.anchorPageId,
+                replacementPageId: body.replacementPageId,
+              }
+            : {}),
         });
         if (activeId.current === result.batch.id) setActive(result);
       } else setScanner(await api(`/api/scanner/${route}`, body));
@@ -318,6 +390,9 @@ function DigitalArchApp() {
     ...(can('ocr:read')
       ? [{ key: 'ocr', label: 'OCR Processing', icon: <FileTextOutlined aria-hidden /> }]
       : []),
+    ...(can('qc:read')
+      ? [{ key: 'qc', label: 'QC Queue', icon: <FileTextOutlined aria-hidden /> }]
+      : []),
     ...(can('batches:reassign')
       ? [{ key: 'assignments', label: 'Batch assignments', icon: <FileTextOutlined aria-hidden /> }]
       : []),
@@ -338,10 +413,20 @@ function DigitalArchApp() {
       </div>
     );
   if (!user) return <AuthScreen onAuthenticated={authenticated} initialError={error} />;
-  if (user.must_change_password || changingPassword)
-    return <AuthScreen user={user} onAuthenticated={authenticated} />;
+  if (user.must_change_password) return <AuthScreen user={user} onAuthenticated={authenticated} />;
   return (
     <Layout className="app-shell">
+      {changingPassword && (
+        <AuthScreen
+          user={user}
+          onCancel={() => setChangingPassword(false)}
+          onAuthenticated={(result) => {
+            setIdentity(result);
+            setCsrfToken(result.csrfToken);
+            setChangingPassword(false);
+          }}
+        />
+      )}
       <Layout.Header className="app-header">
         <span className="brand">
           <ScanOutlined /> DigitalArch
@@ -361,7 +446,10 @@ function DigitalArchApp() {
             />
           )}
           <span>{user.display_name}</span>
-          <Button disabled={busy || !!active} onClick={() => setChangingPassword(true)}>
+          <Button
+            disabled={busy || !!active || ocrMetadataDirty}
+            onClick={() => setChangingPassword(true)}
+          >
             Change password
           </Button>
           <Button
@@ -369,6 +457,7 @@ function DigitalArchApp() {
             disabled={busy}
             onClick={() =>
               run('logout', async () => {
+                if (ocrMetadataDirty && !window.confirm('Discard unsaved metadata edits?')) return;
                 if (active && !locked)
                   await api(`/api/batches/${active.batch.id}/pause`, {
                     version: active.batch.version,
@@ -390,7 +479,7 @@ function DigitalArchApp() {
           <Menu
             mode="horizontal"
             disabled={busy}
-            selectedKeys={[view]}
+            selectedKeys={[view === 'document' ? (can('qc:read') ? 'qc' : 'batches') : view]}
             items={items}
             onClick={({ key }) => navigate(key)}
           />
@@ -414,28 +503,35 @@ function DigitalArchApp() {
                 home={view === 'home'}
                 onNew={newBatch}
                 onOpen={openBatch}
+                onDocument={(id) => showView('document', id)}
                 creating={!!working}
                 userId={user.id}
               />
             ) : view === 'scanner' ? (
               !active ? (
-                <div className="empty-workspace">
-                  <Empty
-                    description={
-                      <>
-                        <h1>No active batch</h1>
-                        <p>Create a new batch or select an existing one.</p>
-                      </>
-                    }
-                  >
-                    <Space>
-                      <Button type="primary" loading={!!working} onClick={newBatch}>
-                        Scan New Batch
-                      </Button>
-                      <Button onClick={() => showView('batches')}>Open My Batches</Button>
-                    </Space>
-                  </Empty>
-                </div>
+                <>
+                  <div className="workspace-toolbar batch-context">
+                    <h1>No active batch</h1>
+                    <span className="muted">A batch is created when you start scanning.</span>
+                    <span className="toolbar-spacer" />
+                    <Button disabled={busy} onClick={() => navigate('batches')}>
+                      Open My Batches
+                    </Button>
+                  </div>
+                  <ScannerWorkspace
+                    requestedMode={requestedMode}
+                    state={scannerState}
+                    busy={busy}
+                    requesting={working}
+                    networkError=""
+                    scenario={scenario}
+                    setScenario={setScenario}
+                    pageDelay={pageDelay}
+                    onAction={scannerAction}
+                    onSettings={() => setSettings(true)}
+                    onPageAction={changePage}
+                  />
+                </>
               ) : (
                 <>
                   <div className="workspace-toolbar batch-context">
@@ -449,6 +545,9 @@ function DigitalArchApp() {
                       )}
                     </div>
                     <span className="toolbar-spacer" />
+                    <Button disabled={busy} onClick={() => leave('document', active.batch.id)}>
+                      Document / Metadata / QC
+                    </Button>
                     {locked ? (
                       <Tag color="success">Capture completed · Read-only</Tag>
                     ) : (
@@ -492,7 +591,9 @@ function DigitalArchApp() {
                           setComplete(true);
                         }}
                       >
-                        Complete Capture
+                        {active.batch.workflow_status === 'rework'
+                          ? 'Resubmit to QC'
+                          : 'Complete Capture'}
                       </Button>
                     )}
                   </div>
@@ -511,15 +612,43 @@ function DigitalArchApp() {
                     onPageAction={changePage}
                     sessions={active.sessions}
                     locked={locked}
+                    initialPageId={capturePageId}
+                    onReplacement={(sessionId, candidateId, cancel) =>
+                      run('replacement', async () => {
+                        setActive(
+                          await api(`/api/batches/${active.batch.id}/replacement`, {
+                            version: active.batch.version,
+                            sessionId,
+                            candidateId,
+                            cancel,
+                          }),
+                        );
+                      })
+                    }
                   />
                 </>
               )
             ) : view === 'ocr' ? (
               <OcrWorkspace
                 user={user}
+                metadataDirty={ocrMetadataDirty}
+                onMetadataDirty={setOcrMetadataDirty}
                 jobId={ocrJobId}
                 onOpen={(id) => showView('ocr', id)}
                 onSettings={() => navigate('settings')}
+                onOpenDocument={(id) => showView('document', id)}
+              />
+            ) : view === 'qc' ? (
+              <QcQueue onOpen={(id) => showView('document', id)} />
+            ) : view === 'document' && documentBatchId ? (
+              <QcWorkspace
+                key={documentBatchId}
+                batchId={documentBatchId}
+                user={user}
+                onBack={backFromDocument}
+                onCapture={openBatch}
+                onDirtyChange={setOcrMetadataDirty}
+                onStatusChange={setDocumentStatus}
               />
             ) : view === 'settings' ? (
               <OcrSettings user={user} />
@@ -534,7 +663,7 @@ function DigitalArchApp() {
                     <>
                       <h1>Your workspace is not yet available</h1>
                       <p>
-                        Your account is ready. QC, approval and published archive workflows will be
+                        Your account is ready. Approval and published archive workflows will be
                         introduced in a later phase.
                       </p>
                     </>
@@ -546,7 +675,15 @@ function DigitalArchApp() {
         </div>
       </Layout.Content>
       <footer className="status-bar">
-        <span>{active ? active.batch.batch_code : 'No active batch'}</span>
+        <span>
+          {view === 'document'
+            ? documentStatus?.batchId === documentBatchId
+              ? documentStatus.text
+              : 'Document review'
+            : active
+              ? active.batch.batch_code
+              : 'No active batch'}
+        </span>
         <span>Asia/Jakarta · WIB</span>
       </footer>
       <ScannerSettings

@@ -78,7 +78,10 @@ try {
   async function changePassword(currentPassword, newPassword) {
     await page.getByLabel('Current password', { exact: true }).fill(currentPassword);
     await page.getByLabel('New password', { exact: true }).fill(newPassword);
-    await page.getByRole('button', { name: 'Change password', exact: true }).click();
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Change password', exact: true })
+      .click();
   }
   async function choose(label, option) {
     await page.getByLabel(label, { exact: true }).click();
@@ -113,7 +116,7 @@ try {
   await page.goto(f.origin);
   await contained('login-1366');
   await signIn('browser-admin', adminAccount.temporaryPassword);
-  await page.getByRole('heading', { name: 'Choose your password' }).waitFor();
+  await page.getByRole('dialog', { name: 'Choose your password', exact: true }).waitFor();
   await changePassword(adminAccount.temporaryPassword, adminPassword);
   await page.getByRole('heading', { name: 'Users', exact: true }).waitFor();
   assert.equal(
@@ -139,6 +142,19 @@ try {
   await signIn('browser-operator', temporary);
   await changePassword(temporary, operatorPassword);
   await page.getByRole('button', { name: 'Scan New Batch', exact: true }).waitFor();
+  const workspaceUrl = page.url();
+  await page.getByRole('button', { name: 'Change password', exact: true }).click();
+  const passwordDialog = page.getByRole('dialog', { name: 'Change password', exact: true });
+  await passwordDialog.waitFor();
+  assert.equal(page.url(), workspaceUrl);
+  await passwordDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await passwordDialog.waitFor({ state: 'hidden' });
+  assert.equal(page.url(), workspaceUrl);
+  await page.getByRole('button', { name: 'Change password', exact: true }).click();
+  await changePassword(operatorPassword, `browser-updated-${randomUUID()}`);
+  await passwordDialog.waitFor({ state: 'hidden' });
+  assert.equal(page.url(), workspaceUrl);
+  await page.getByRole('button', { name: 'Scan New Batch', exact: true }).waitFor();
   const activity = page.getByRole('region', { name: 'Recent activity', exact: true });
   const activityToggle = activity.getByRole('button', { name: 'Recent activity', exact: true });
   assert.equal(await activityToggle.getAttribute('aria-expanded'), 'false');
@@ -153,18 +169,26 @@ try {
     await page.setViewportSize({ width, height });
     await contained(`home-${width}`);
   }
-  await page.getByRole('menuitem', { name: 'Scanner', exact: true }).click();
+  const batchCountBefore = (
+    await f.pool.query('SELECT count(*)::int AS count FROM archive_batches')
+  ).rows[0].count;
+  await page.getByRole('button', { name: 'Scan New Batch', exact: true }).click();
   await page.getByRole('heading', { name: 'No active batch', exact: true }).waitFor();
   assert.equal(await page.locator('.scanner-page').count(), 0);
+  assert.equal(
+    (await f.pool.query('SELECT count(*)::int AS count FROM archive_batches')).rows[0].count,
+    batchCountBefore,
+  );
+  await page.getByRole('menuitem', { name: 'Capture Workspace', exact: true }).click();
   await page.getByRole('button', { name: 'Scan New Batch', exact: true }).click();
-  await page.getByRole('button', { name: 'Batch Info', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Scan feeder', exact: true }).waitFor();
+  assert.equal(
+    (await f.pool.query('SELECT count(*)::int AS count FROM archive_batches')).rows[0].count,
+    batchCountBefore,
+  );
+  assert.equal(await page.getByRole('button', { name: 'Batch Info', exact: true }).count(), 0);
   assert.equal(await page.locator('[aria-label="Captured page count"]').innerText(), '0');
-  const batchA = (await page.locator('.batch-context h1').innerText()).split(' · ')[1];
-  assert.match(batchA, /^B-\d{8}-\d{6}-[A-F0-9]{8}$/);
   assert.equal(await page.getByLabel('Document title', { exact: true }).count(), 0);
-  await page.getByRole('button', { name: 'Batch Info', exact: true }).click();
-  await page.getByLabel('Physical location', { exact: true }).fill('Rack A-12');
-  await page.getByRole('button', { name: 'Save location', exact: true }).click();
   await page.getByRole('button', { name: 'Advanced scanner settings', exact: true }).click();
   await page.getByLabel('Page Delay (ms)', { exact: true }).fill('200');
   await page.getByRole('button', { name: 'Close settings', exact: true }).click();
@@ -177,6 +201,17 @@ try {
   assert.equal((await started).status(), 200);
   await page.reload();
   await captureFinished(1, 4);
+  assert.equal(
+    (await f.pool.query('SELECT count(*)::int AS count FROM archive_batches')).rows[0].count,
+    batchCountBefore + 1,
+  );
+  const batchA = (await page.locator('.batch-context h1').innerText())
+    .split(' · ')[1]
+    .split(' (')[0];
+  assert.match(batchA, /^B-\d{8}-\d{6}-[A-F0-9]{8}$/);
+  await page.getByRole('button', { name: 'Batch Info', exact: true }).click();
+  await page.getByLabel('Physical location', { exact: true }).fill('Rack A-12');
+  await page.getByRole('button', { name: 'Save location', exact: true }).click();
   assert.equal(await page.locator('.scanner-page').count(), 4);
   assert.equal(await page.locator('.scan-message').count(), 0);
   assert.equal(await page.getByText(/^(Last|This) session:/).count(), 0);
@@ -202,7 +237,27 @@ try {
     ),
   );
   await page.getByRole('button', { name: 'Actual size (original)', exact: true }).click();
-  await page.getByRole('button', { name: 'Fit page', exact: true }).click();
+  await page.getByRole('button', { name: 'Fit width', exact: true }).click();
+  const pageViewport = page.locator('.image-viewport');
+  const fitWidth = await pageViewport
+    .locator('.image-paper')
+    .evaluate((element) => element.offsetWidth);
+  const viewportWidth = await pageViewport.evaluate((element) => element.clientWidth);
+  assert.ok(Math.abs(fitWidth - (viewportWidth - 32)) <= 2);
+  await pageViewport.hover();
+  await page.keyboard.down('Control');
+  await page.mouse.wheel(0, -100);
+  await page.keyboard.up('Control');
+  await page.waitForFunction(
+    (width) => document.querySelector('.image-paper').offsetWidth > width,
+    fitWidth,
+  );
+  await pageViewport.focus();
+  await page.keyboard.press('Control+0');
+  await page.waitForFunction(
+    (width) => Math.abs(document.querySelector('.image-paper').offsetWidth - width) <= 2,
+    fitWidth,
+  );
   await page.getByRole('button', { name: 'Fullscreen preview', exact: true }).click();
   await page.getByRole('dialog').waitFor();
   await page.keyboard.press('Escape');
@@ -242,7 +297,6 @@ try {
   await page.getByRole('heading', { name: 'No active batch', exact: true }).waitFor();
   assert.equal(await page.locator('.thumbnail-media').count(), 0);
   await contained('empty-scanner-1280');
-  await page.getByRole('button', { name: 'Scan New Batch', exact: true }).click();
   await choose('Simulation Scenario', 'Normal Document');
   await page.getByRole('button', { name: 'Scan feeder', exact: true }).click();
   await captureFinished(1, 1);
@@ -316,6 +370,7 @@ try {
       : route.continue(),
   );
   await page.getByRole('button', { name: 'Scan New Batch', exact: true }).click();
+  await page.getByRole('button', { name: 'Scan feeder', exact: true }).click();
   await page
     .getByText('Database unavailable. Retry after PostgreSQL recovers.', { exact: true })
     .waitFor();

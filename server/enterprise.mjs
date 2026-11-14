@@ -5,6 +5,7 @@ import { batchOperations } from './batches.mjs';
 import { captureStorage } from './capture-storage.mjs';
 import { failure } from './errors.mjs';
 import { ocrProcessing } from './ocr.mjs';
+import { qualityControl } from './qc.mjs';
 
 export function enterprise({
   scanner,
@@ -22,6 +23,7 @@ export function enterprise({
   let sweeping = false;
   let closed = false;
   const ocr = ocrProcessing(pool, storage, { ...ocrOptions, allowed: () => !!lock && !closed });
+  const qc = qualityControl(pool, storage);
   const batches = batchOperations(pool, scanner, storage, {
     ocrLanguage: null,
     ocrConfig: null,
@@ -84,6 +86,7 @@ export function enterprise({
     batches,
     storage,
     ocr,
+    qc,
     ready: ensure,
     async start() {
       try {
@@ -99,6 +102,7 @@ export function enterprise({
         try {
           await ensure();
           await batches.sweep();
+          await qc.refresh();
         } catch {
           /* Retry without deleting spool or managed originals. */
         } finally {
@@ -111,6 +115,8 @@ export function enterprise({
       closed = true;
       clearInterval(timer);
       await ocr.close();
+      while (sweeping) await new Promise((resolve) => setTimeout(resolve, 10));
+      await storage.close();
       // Close only after any final page transaction releases its client.
       if (lock) {
         await lock
@@ -149,6 +155,57 @@ export function enterprise({
             403,
           );
         const permit = (permission) => requirePermission(user, permission);
+        if (pathname === '/api/qc/queue' && method === 'GET')
+          return await qc.queue(user, {
+            filter: url.searchParams.get('filter') || 'waiting',
+            search: url.searchParams.get('search') || '',
+            metadata: url.searchParams.get('metadata') || '',
+            ocr: url.searchParams.get('ocr') || '',
+            sort: url.searchParams.get('sort') || 'updated_at',
+            direction: url.searchParams.get('direction') || 'desc',
+            limit: numeric(url.searchParams.get('limit'), 25, 100),
+            offset: numeric(url.searchParams.get('offset'), 0, 1_000_000),
+          });
+        const qcRoute = pathname.match(
+          /^\/api\/qc\/([^/]+)(?:\/(claim|release|reassign|heartbeat|save|pass|return|findings|page-review|page-edit|correct-text|policy|reprocess-ocr))?$/,
+        );
+        if (qcRoute) {
+          const [, id, action] = qcRoute;
+          if (method === 'GET' && !action) return await qc.get(user, id);
+          if (method === 'POST') {
+            if (action === 'claim') return await qc.claim(user, id, body);
+            if (action === 'release' || action === 'reassign')
+              return await qc.release(user, id, body, action === 'reassign');
+            if (action === 'heartbeat') return await qc.heartbeat(user, id, body);
+            if (action === 'save') return await qc.save(user, id, body);
+            if (action === 'pass' || action === 'return')
+              return await qc.decision(user, id, body, action === 'pass');
+            if (action === 'findings') return await qc.finding(user, id, body);
+            if (action === 'page-review') return await qc.pageReview(user, id, body);
+            if (action === 'page-edit') return await qc.pageEdit(user, id, body);
+            if (action === 'correct-text') return await qc.correctText(user, id, body);
+            if (action === 'reprocess-ocr') return await qc.reprocess(user, id, body);
+            if (action === 'policy') return await qc.policy(user, id, body);
+          }
+        }
+        const qcPage = pathname.match(/^\/api\/qc\/([^/]+)\/pages\/([^/]+)$/);
+        if (qcPage && method === 'GET') return await qc.pageInfo(user, qcPage[1], qcPage[2]);
+        const revisionImage = pathname.match(
+          /^\/api\/qc\/([^/]+)\/pages\/([^/]+)\/revisions\/([^/]+)\/(image|preview)$/,
+        );
+        if (revisionImage && method === 'GET')
+          return await qc.revisionImage(user, ...revisionImage.slice(1));
+        const documentMetadata = pathname.match(
+          /^\/api\/batches\/([^/]+)\/metadata(?:\/(extract))?$/,
+        );
+        if (documentMetadata) {
+          if (method === 'GET' && !documentMetadata[2])
+            return await qc.metadata(user, documentMetadata[1]);
+          if (method === 'PATCH' && !documentMetadata[2])
+            return await qc.metadata(user, documentMetadata[1], body);
+          if (method === 'POST' && documentMetadata[2])
+            return await qc.metadata(user, documentMetadata[1], body, true);
+        }
         if (pathname === '/api/settings/ocr') {
           if (method === 'GET') return await ocr.getSettings(user);
           if (method === 'PATCH') return await ocr.updateSettings(user, body);
@@ -169,6 +226,17 @@ export function enterprise({
         const ocrImage = pathname.match(
           /^\/api\/ocr\/jobs\/([^/]+)\/pages\/([^/]+)\/(image|preview)$/,
         );
+        const metadata = pathname.match(/^\/api\/ocr\/jobs\/([^/]+)\/metadata(?:\/(extract))?$/);
+        if (metadata && method === 'GET' && !metadata[2])
+          return await ocr.metadata.get(user, metadata[1]);
+        if (metadata && ['POST', 'PATCH'].includes(method)) {
+          await ocr.metadata.get(user, metadata[1]);
+          throw failure(
+            'metadata_moved',
+            'OCR-run metadata is a historical snapshot. Edit document metadata in the Document / QC workspace.',
+            409,
+          );
+        }
         if (ocrImage && method === 'GET') return await ocr.image(user, ...ocrImage.slice(1));
         if (ocrJob) {
           const [, id, action] = ocrJob;
@@ -268,13 +336,15 @@ export function enterprise({
             return await batches.list(user, {
               search,
               status,
+              sort: url.searchParams.get('sort') || 'updated_at',
+              direction: url.searchParams.get('direction') || 'desc',
               limit: numeric(url.searchParams.get('limit'), 25, 100),
               offset: numeric(url.searchParams.get('offset'), 0, 1_000_000),
             });
           }
         }
         const batch = pathname.match(
-          /^\/api\/batches\/([^/]+)(?:\/(resume|pause|complete-capture|cancel|scan-sessions|pages|reassign|delete|ocr))?$/,
+          /^\/api\/batches\/([^/]+)(?:\/(resume|pause|complete-capture|resubmit-qc|cancel|scan-sessions|pages|reassign|delete|ocr|replacement|reorder))?$/,
         );
         if (batch) {
           const [, id, operation] = batch;
@@ -295,6 +365,17 @@ export function enterprise({
             return await batches.location(user, id, body);
           }
           if (method === 'POST') {
+            if (operation === 'replacement' || operation === 'reorder') {
+              permit('batches:update');
+              return await batches[operation](user, id, body);
+            }
+            if (operation === 'resubmit-qc') {
+              permit('batches:complete_capture');
+              const current = await batches.get(user, id);
+              if (current.batch.workflow_status !== 'rework')
+                throw failure('workflow_locked', 'This batch is not in rework.', 409);
+              return await batches.transition(user, id, 'complete-capture', body);
+            }
             if (operation === 'ocr') return await ocr.enqueue(user, id, body);
             if (!operation || operation === 'pages')
               throw failure('not_found', 'Operation not found.', 404);
@@ -326,15 +407,19 @@ export function enterprise({
           permit('batches:update');
           return await batches.editPage(user, pageEdit[1], body);
         }
-        const page = pathname.match(/^\/api\/pages\/([^/]+)\/(image|thumbnail|preview)$/);
+        const page = pathname.match(/^\/api\/pages\/([^/]+)\/(image|thumbnail|preview|original)$/);
         if (page && method === 'GET') {
           if (!user.permissions.includes('batches:read_all')) permit('batches:read');
           const record = await batches.page(user, page[1]);
-          const handle =
-            page[2] === 'image'
-              ? await storage.open(record.active_storage_key)
-              : await storage.derivative(record, page[2]);
-          return { file: handle, mime: page[2] === 'image' ? 'image/png' : 'image/webp' };
+          const handle = ['image', 'original'].includes(page[2])
+            ? await storage.open(
+                page[2] === 'original' ? record.original_storage_key : record.active_storage_key,
+              )
+            : await storage.derivative(record, page[2]);
+          return {
+            file: handle,
+            mime: ['image', 'original'].includes(page[2]) ? 'image/png' : 'image/webp',
+          };
         }
         throw failure('not_found', 'Operation not found.', 404);
       } catch (error) {

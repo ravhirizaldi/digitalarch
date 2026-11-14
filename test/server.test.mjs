@@ -17,7 +17,7 @@ test('database: vector, migration idempotency, UUID relationships, constraints, 
   );
   await migrate(f.pool);
   await migrate(f.pool);
-  assert.equal((await f.pool.query('SELECT * FROM schema_migrations')).rowCount, 8);
+  assert.equal((await f.pool.query('SELECT * FROM schema_migrations')).rowCount, 11);
   const operator = await f.account();
   const a = (await operator.request('/api/batches', { physicalLocation: 'Rack A-12' })).body;
   const b = (await operator.request('/api/batches', { physicalLocation: 'Rack A-12' })).body;
@@ -28,7 +28,7 @@ test('database: vector, migration idempotency, UUID relationships, constraints, 
   const docs = (await f.pool.query('SELECT * FROM documents WHERE batch_id=$1', [a.batch.id])).rows;
   assert.equal(docs.length, 1);
   assert.equal(docs[0].title, null);
-  assert.equal(docs[0].metadata_status, 'pending');
+  assert.equal(docs[0].metadata_status, 'not_extracted');
   await f.pool.query('INSERT INTO documents(batch_id,document_index) VALUES($1,2)', [a.batch.id]);
   await assert.rejects(
     f.pool.query('INSERT INTO documents(batch_id,document_index) VALUES($1,1)', [randomUUID()]),
@@ -41,6 +41,35 @@ test('database: vector, migration idempotency, UUID relationships, constraints, 
     ]),
     { code: '23505' },
   );
+});
+
+test('batch lists sort the full owned result and return filtered counters', async (t) => {
+  const f = await testApplication(t);
+  const operator = await f.account();
+  const other = await f.account();
+  const z = (await operator.request('/api/batches', { physicalLocation: 'Rack Z' })).body.batch;
+  const a = (await operator.request('/api/batches', { physicalLocation: 'Rack A' })).body.batch;
+  await other.request('/api/batches', { physicalLocation: 'Rack A' });
+  const first = await operator.request('/api/batches?sort=physical_location&direction=asc&limit=1');
+  assert.equal(first.status, 200);
+  assert.equal(first.body.total, 2);
+  assert.equal(first.body.pages, 0);
+  assert.equal(first.body.sessions, 0);
+  assert.equal(first.body.batches[0].id, a.id);
+  assert.equal(
+    (await operator.request('/api/batches?sort=physical_location&direction=asc&limit=1&offset=1'))
+      .body.batches[0].id,
+    z.id,
+  );
+  const filtered = await operator.request('/api/batches?search=Rack%20Z');
+  assert.equal(filtered.body.total, 1);
+  assert.equal(filtered.body.batches[0].id, z.id);
+  assert.equal(
+    (await operator.request('/api/batches?sort=updated_at%3BDROP%20TABLE%20archive_batches'))
+      .status,
+    400,
+  );
+  assert.equal((await operator.request('/api/batches?direction=sideways')).status, 400);
 });
 
 test('authentication: bootstrap once, Argon2id, forced change, cookies, CSRF, logout and revoked/expired/disabled sessions', async (t) => {

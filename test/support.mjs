@@ -90,7 +90,7 @@ export async function testApplication(t, options = {}) {
     await service.application.close();
     await root.query(`DROP SCHEMA ${schema} CASCADE`);
     await root.end();
-    await rm(dataDir, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   };
   if (t) t.after(cleanup);
   return {

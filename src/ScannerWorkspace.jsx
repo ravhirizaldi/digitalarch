@@ -8,6 +8,7 @@ import {
   Pagination,
   Segmented,
   Select,
+  Modal,
   Space,
   Splitter,
 } from 'antd';
@@ -38,8 +39,13 @@ export default function ScannerWorkspace({
   onPageAction,
   sessions = [],
   locked = false,
+  initialPageId = null,
+  onReplacement,
 }) {
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(initialPageId);
+  const [placement, setPlacement] = useState('append');
+  const [replacement, setReplacement] = useState(false);
+  const [candidateId, setCandidateId] = useState(null);
   const [sessionKey, setSessionKey] = useState('all');
   const [listPage, setListPage] = useState(1);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -57,16 +63,21 @@ export default function ScannerWorkspace({
   );
   const currentListPage = Math.min(listPage, Math.max(1, Math.ceil(pages.length / 50)));
   const page = pages.find((page) => page.id === selected) || pages[0];
+  const pending = sessions.find(
+    (s) => s.replacement_status === 'pending' && s.status !== 'running',
+  );
+  const candidates = pending ? state.pageDetails.filter((p) => p.sessionId === pending.id) : [];
   useEffect(() => {
     if (state.job?.id) {
       setSessionKey('all');
-      setSelected(null);
+      setSelected(initialPageId);
       setListPage(1);
     }
-  }, [state.job?.id, state.job?.provider]);
+  }, [state.job?.id, state.job?.provider, initialPageId]);
   const scanning = state.status === 'scanning' || requesting === 'scan';
   const scanDisabled =
     locked ||
+    !!pending ||
     busy ||
     !scanner.canScan ||
     !!networkError ||
@@ -218,6 +229,15 @@ export default function ScannerWorkspace({
                     }}
                   />
                 )}
+                <Button
+                  disabled={busy || !!pending || page.excluded}
+                  onClick={() => {
+                    setSelected(page.id);
+                    setReplacement(true);
+                  }}
+                >
+                  Replace Page
+                </Button>
               </>
             )}
           </Space>
@@ -313,11 +333,28 @@ export default function ScannerWorkspace({
               icon={<ScanOutlined aria-hidden />}
               loading={scanning || requesting === 'scan'}
               disabled={scanDisabled}
-              onClick={() => onAction('scan', simulator ? { scenario, pageDelay } : {})}
+              onClick={() =>
+                onAction('scan', {
+                  options: simulator ? { scenario, pageDelay } : {},
+                  placement,
+                  anchorPageId: placement === 'append' ? null : page?.id,
+                })
+              }
             >
               Scan feeder
             </Button>
           </Space>
+          <Select
+            aria-label="New page placement"
+            value={placement}
+            disabled={busy || !!pending}
+            onChange={setPlacement}
+            options={[
+              { value: 'append', label: 'Append to end' },
+              { value: 'before', label: 'Insert before selected', disabled: !page },
+              { value: 'after', label: 'Insert after selected', disabled: !page },
+            ]}
+          />
         </div>
       )}
       {((!locked && requestedMode) || feedback) && (
@@ -346,6 +383,77 @@ export default function ScannerWorkspace({
           <Splitter.Panel min={300}>{preview}</Splitter.Panel>
         </Splitter>
       )}
+      <Modal
+        title={`Replace page ${page?.pageNumber || ''}`}
+        open={replacement}
+        onCancel={() => setReplacement(false)}
+        okText="Scan replacement candidates"
+        okButtonProps={{ disabled: scanDisabled }}
+        onOk={() => {
+          setReplacement(false);
+          onAction('scan', {
+            options: simulator ? { scenario, pageDelay } : {},
+            replacementPageId: page.id,
+          });
+        }}
+      >
+        <p>
+          The active image remains unchanged until you preview and explicitly confirm a replacement.
+          All feeder images are retained.
+        </p>
+      </Modal>
+      <Modal
+        title="Preview and confirm replacement"
+        open={!!pending}
+        footer={null}
+        closable={false}
+        width={760}
+      >
+        <Select
+          aria-label="Replacement candidate"
+          value={candidateId}
+          placeholder="Choose a captured candidate explicitly"
+          onChange={setCandidateId}
+          options={candidates.map((p) => ({ value: p.id, label: `Candidate ${p.pageNumber}` }))}
+        />
+        {candidateId && candidates.some((p) => p.id === candidateId) && (
+          <div className="replacement-preview">
+            <PageViewer
+              image={{ imageId: candidateId }}
+              label="Replacement candidate"
+              previewUrl={`/api/pages/${candidateId}/preview`}
+              originalUrl={`/api/pages/${candidateId}/image`}
+            />
+          </div>
+        )}
+        {!candidates.length && (
+          <Alert
+            type="warning"
+            title="No valid replacement was captured. Cancel to keep the current image unchanged."
+          />
+        )}
+        <Space>
+          <Button
+            disabled={busy}
+            onClick={() => {
+              onReplacement(pending.id, null, true);
+              setCandidateId(null);
+            }}
+          >
+            Cancel replacement
+          </Button>
+          <Button
+            type="primary"
+            disabled={busy || !candidates.some((p) => p.id === candidateId)}
+            onClick={() => {
+              onReplacement(pending.id, candidateId, false);
+              setCandidateId(null);
+            }}
+          >
+            Confirm selected replacement
+          </Button>
+        </Space>
+      </Modal>
       <Drawer
         title="Batch pages"
         placement="left"

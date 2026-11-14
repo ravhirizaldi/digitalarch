@@ -24,7 +24,7 @@ export const dateTime = (value) =>
     : 'Not recorded';
 export function IconButton({ label, icon, ...props }) {
   return (
-    <Tooltip title={label}>
+    <Tooltip title={label} trigger={['hover', 'focus']}>
       <Button aria-label={label} icon={icon} {...props} />
     </Tooltip>
   );

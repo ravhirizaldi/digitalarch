@@ -15,7 +15,7 @@ import {
 import { PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import { api } from './api';
 import { dateTime } from './ui';
-import { useTableHeight } from './BatchList';
+import { useTableHeight } from './WorklistTable';
 
 export default function Administration({ view, user }) {
   const { modal } = App.useApp();

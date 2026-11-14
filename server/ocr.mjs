@@ -6,6 +6,8 @@ import { ocrSettings } from './ocr-provider.mjs';
 import { ocrProvider } from './ocr-engines.mjs';
 import { ocrDefaults } from './ocr-defaults.mjs';
 import { processingConfig } from './ocr-profiles.mjs';
+import { documentMetadata } from './document-metadata.mjs';
+import { documentFor } from './workflow.mjs';
 
 const jobSelect = `SELECT j.*,b.batch_code,b.assigned_operator_id,
   (SELECT count(*)::int FROM scan_sessions s WHERE s.batch_id=j.batch_id) AS session_count,
@@ -37,6 +39,22 @@ export function ocrProcessing(pool, storage, options = {}) {
   async function authorize(user, id, manage = false, client = pool, lock = false) {
     uuid(id);
     requirePermission(user, manage ? 'ocr:manage' : 'ocr:read');
+    if (manage) {
+      const source = (await client.query('SELECT batch_id FROM ocr_jobs WHERE id=$1', [id]))
+        .rows[0];
+      if (source) {
+        await client.query('SELECT id FROM archive_batches WHERE id=$1 FOR UPDATE', [
+          source.batch_id,
+        ]);
+        const doc = await documentFor(client, source.batch_id, true);
+        if (['qc_in_review', 'awaiting_approval_l1'].includes(doc?.workflow_status))
+          throw failure(
+            'document_locked',
+            'OCR history is locked during or after QC. Use the QC workspace.',
+            409,
+          );
+      }
+    }
     const job = (
       await client.query(
         `${jobSelect} WHERE j.id=$1 AND b.deleted_at IS NULL ${lock ? 'FOR UPDATE OF j' : ''}`,
@@ -389,6 +407,7 @@ export function ocrProcessing(pool, storage, options = {}) {
   }
   return {
     settings,
+    metadata: documentMetadata(pool, authorize),
     initializeDefaults: defaults.current,
     getSettings: defaults.get,
     updateSettings: defaults.update,
@@ -468,6 +487,13 @@ export function ocrProcessing(pool, storage, options = {}) {
           throw failure('forbidden', 'This batch belongs to another operator.', 403);
         if (batch.status !== 'capture_completed')
           throw failure('batch_locked', 'Complete capture before sending the batch to OCR.', 409);
+        const doc = await documentFor(client, batchId, true);
+        if (['qc_in_review', 'awaiting_approval_l1'].includes(doc?.workflow_status))
+          throw failure(
+            'document_locked',
+            'OCR is controlled by the QC workspace during or after review.',
+            409,
+          );
         const queued = (
           await client.query('SELECT queue_batch_ocr($1,$2,$3) AS id', [batchId, null, config])
         ).rows[0].id;

@@ -12,12 +12,14 @@ import {
   Splitter,
   Table,
   Tag,
+  Tabs,
 } from 'antd';
 import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons';
 import { api } from './api';
 import { dateTime } from './ui';
-import { useTableHeight } from './BatchList';
+import { useTableHeight } from './WorklistTable';
 import PageViewer from './PageViewer';
+import MetadataPanel from './MetadataPanel';
 
 const labels = {
   queued: 'Queued',
@@ -47,7 +49,15 @@ const statusTag = (status) => (
 const percentage = (job) =>
   Math.floor(((job.processed_pages + job.failed_pages) * 100) / job.total_pages);
 
-export default function OcrWorkspace({ user, jobId, onOpen, onSettings }) {
+export default function OcrWorkspace({
+  user,
+  jobId,
+  onOpen,
+  onSettings,
+  metadataDirty,
+  onMetadataDirty,
+  onOpenDocument,
+}) {
   const [selected, setSelected] = useState(null);
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState('');
@@ -99,13 +109,19 @@ export default function OcrWorkspace({ user, jobId, onOpen, onSettings }) {
     user.permissions.includes('ocr:manage') &&
     (job.assigned_operator_id === user.id || user.permissions.includes('ocr:manage_all'));
   async function control(action) {
+    if (
+      action === 'reprocess' &&
+      metadataDirty &&
+      !window.confirm('Discard unsaved metadata edits?')
+    )
+      return;
     setWorking(true);
     try {
       const result = await api(`/api/ocr/jobs/${job.id}/${action}`, {
         version: job.version,
       });
       if (action === 'reprocess') {
-        open(result.job.id);
+        open(result.job.id, true);
         return;
       }
       setData((value) => ({ ...value, ...result }));
@@ -116,7 +132,9 @@ export default function OcrWorkspace({ user, jobId, onOpen, onSettings }) {
       setWorking(false);
     }
   }
-  function open(id) {
+  function open(id, discardApproved = false) {
+    if (!discardApproved && metadataDirty && !window.confirm('Discard unsaved metadata edits?'))
+      return;
     onOpen(id);
     setPage(1);
     setSelected(null);
@@ -172,6 +190,9 @@ export default function OcrWorkspace({ user, jobId, onOpen, onSettings }) {
           </Button>
         )}
         <h1>{jobId ? job?.batch_code || 'OCR job' : 'OCR Processing'}</h1>
+        {job && (
+          <Button onClick={() => onOpenDocument(job.batch_id)}>Document metadata / QC</Button>
+        )}
         {job && statusTag(job.status)}
         {!jobId && (
           <Select
@@ -429,36 +450,74 @@ export default function OcrWorkspace({ user, jobId, onOpen, onSettings }) {
             </Splitter.Panel>
             <Splitter.Panel min={300}>
               <section className="ocr-text-panel" aria-label="Page OCR result">
-                <div className="panel-heading">
-                  <h2>Recognized text</h2>
-                </div>
-                {current?.is_stale && (
-                  <Alert
-                    type="warning"
-                    showIcon
-                    title="Historical revision. This text is not current."
-                  />
-                )}
-                {current?.error_message && (
-                  <Alert
-                    type="error"
-                    showIcon
-                    title={current.error_message}
-                    description={current.error_code}
-                  />
-                )}
-                {current && (
-                  <div className="ocr-page-meta">
-                    {current.processed_at ? dateTime(current.processed_at) : 'Not processed'}
-                    {current.processing_ms != null ? ` · ${current.processing_ms} ms` : ''}
-                  </div>
-                )}
-                <pre className="ocr-extracted-text" tabIndex={0} aria-label="Extracted text">
-                  {current?.extracted_text ||
-                    (current?.status === 'completed'
-                      ? 'No text recognized.'
-                      : 'Extracted text will appear after this page is processed.')}
-                </pre>
+                <Tabs
+                  className="ocr-result-tabs"
+                  defaultActiveKey="text"
+                  items={[
+                    {
+                      key: 'text',
+                      label: 'Recognized text',
+                      forceRender: true,
+                      children: (
+                        <>
+                          {current?.is_stale && (
+                            <Alert
+                              type="warning"
+                              showIcon
+                              title="Historical revision. This text is not current."
+                            />
+                          )}
+                          {current?.error_message && (
+                            <Alert
+                              type="error"
+                              showIcon
+                              title={current.error_message}
+                              description={current.error_code}
+                            />
+                          )}
+                          {current && (
+                            <div className="ocr-page-meta">
+                              {current.processed_at
+                                ? dateTime(current.processed_at)
+                                : 'Not processed'}
+                              {current.processing_ms != null
+                                ? ` · ${current.processing_ms} ms`
+                                : ''}
+                            </div>
+                          )}
+                          <pre
+                            className="ocr-extracted-text"
+                            tabIndex={0}
+                            aria-label="Extracted text"
+                          >
+                            {current?.extracted_text ||
+                              (current?.status === 'completed'
+                                ? 'No text recognized.'
+                                : 'Extracted text will appear after this page is processed.')}
+                          </pre>
+                        </>
+                      ),
+                    },
+                    {
+                      key: 'metadata',
+                      label: 'Run metadata history',
+                      children: job && (
+                        <MetadataPanel
+                          key={job.id}
+                          job={job}
+                          canManage={false}
+                          onDirtyChange={onMetadataDirty}
+                          onSource={(source) => {
+                            setPage(
+                              Math.floor((source.pageOffset ?? source.pageNumber - 1) / 25) + 1,
+                            );
+                            setSelected(source.pageId);
+                          }}
+                        />
+                      ),
+                    },
+                  ]}
+                />
               </section>
             </Splitter.Panel>
           </Splitter>

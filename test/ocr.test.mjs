@@ -424,7 +424,8 @@ test('OCR controls: pause at page boundary, resume, cancel queued without deleti
 });
 
 test('OCR completion rollback: an enqueue failure cannot leave capture completed without a job', async (t) => {
-  const f = await fixture(t, provider(), { language: 'invalid-server-setting' });
+  const f = await fixture(t, provider());
+  await f.pool.query('ALTER TABLE ocr_jobs ADD CONSTRAINT test_enqueue_failure CHECK(false)');
   let result = (await f.operator.request('/api/batches', {})).body;
   result = await scanned(f.operator, result.batch, { scenario: 'single', pageDelay: 0 });
   const response = await f.operator.request(`/api/batches/${result.batch.id}/complete-capture`, {
@@ -588,7 +589,7 @@ test('OCR security: authentication, ownership, admin permissions, CSRF, validati
   assert.equal((await fetch(f.origin + url)).status, 401);
   for (const route of [url, `${url}/pages`, `/api/pages/${captured.pages[0].id}/ocr`]) {
     assert.equal((await other.request(route)).status, 403);
-    assert.equal((await qc.request(route)).status, 403);
+    assert.equal((await qc.request(route)).status, 200);
     assert.equal((await f.admin.request(route)).status, 200);
   }
   assert.equal((await other.request('/api/ocr/jobs')).body.total, 0);

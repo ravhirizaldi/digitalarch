@@ -1,6 +1,91 @@
-# DigitalArch Enterprise Foundation — engineering report
+# DigitalArch — engineering report
 
-**Delivered locally on 2026-11-13.** Authentication, administration and persistent batch capture replace the former global capture/JSON-QC workflow. The user-authorized physical test succeeded. No commits, pushes or publication were performed; this workspace is not a Git repository.
+## Current handoff addendum — shared worklists, URLs and documentation (2026-11-14)
+
+- Repository handoff: the user explicitly authorized committing/pushing the current source and documentation to the existing public `ravhirizaldi/digitalarch` repository. Earlier statements about uncommitted local work describe their historical checkpoints. Private `.env`, `.local` scans/models/backups and generated local evidence remain excluded. README is now a short overview; detailed installation and the full documentation index live in [SETUP.md](SETUP.md).
+- QC now has Shared/Claimed tabs, combined search/metadata/OCR filters, allowlisted server sorting, queue-wide counts, filtered totals and compact batch info/copy controls. `src/WorklistTable.jsx` shares the bounded table, icon headings, totals and right-aligned pagination with operator Capture Workspace/My Batches and administrator batch assignments. Batch sorting now also applies server-side across the full filtered result.
+- `src/useUrlState.js` and the existing route guard preserve QC/operator list state and document inspector/page/session/revision/preview/disclosure choices. Returning from a document restores a supported originating list. Draft/private document text is not serialized; queue search terms remain visible in URL history. Other OCR/admin/scanner controls are not all URL-backed.
+- **Verification boundary:** the later queue/shared-component/URL changes were not test-, browser-, build- or OCR-verified at the user's request. Targeted ESLint, source formatting and `git diff --check` passed; the static UI detector reported no findings. New/extended regression cases were written but not executed. The 80/80 result below belongs to the earlier approved checkpoint, not these later changes.
+- Added [DND.md](DND.md), [ERD.md](ERD.md), [DFD.md](DFD.md) and the proposed [APPROVAL.md](APPROVAL.md) handoff; linked the documentation from README and updated source/schema/verification boundaries. Mermaid diagrams describe the implemented schema/flows or are explicitly labelled proposals. Documentation work did not change runtime behavior, apply migrations or authorize new verification.
+- The documentation pass used static source/migration inspection, formatting and relative-file-link checks. No Mermaid rendering, runtime tests, browser checks, OCR inference, scanning or live-schema queries were performed during this pass.
+- Remaining requested workflow is Approval Level 1 → Approval Level 2 → a basic authenticated read-only viewer. Seeded roles/permissions and the locked QC snapshot are reusable foundations, not working approval/archive features. Rejection routing, historical actor separation, snapshot-bound reads and extending current L1-only locks are the principal remaining correctness work. No new scanner/OCR pipeline is proposed.
+
+## Phase 4 — document metadata, QC and operator rework (2026-11-14)
+
+This section records the earlier Phase 4 delivery/approved verification checkpoint. Later refinements and their unverified scope are listed above.
+
+### A. Outcome and scope
+
+Implemented the PostgreSQL-backed QC queue, shared document workstation, persistent exclusive claims, document metadata verification, non-destructive corrections and same-batch return/resubmission. QC Pass stops at **Awaiting Approval Level 1** and locks the reviewed revision. No approval, publication, search, PDF, AI classifier, new recognition engine or queue service was added. Changes remain local and uncommitted; no push/publication was performed.
+
+### B. Audit and reused architecture
+
+Inspected capture/session reconciliation, original/derivative storage, authentication/RBAC, existing migrations, PostgreSQL OCR queue/leases/cache, metadata extraction, browser routes and the compact Ant Design workstation. The earlier global JSON QC implementation had already been removed; no competing registry was extended or restored. Reused `documents`, `pages`, `page_revisions`, `archive_batches`, the scanner provider and existing metadata/parser/viewer components. The new modules are `server/workflow.mjs`, `server/qc-metadata.mjs`, `server/qc.mjs` and `src/QcWorkspace.jsx`.
+
+### C. Database and upgrade
+
+- Migration 009 stores the earlier per-run metadata snapshots.
+- Migration 010 adds document workflow/version/revision, QC cycles/claims, findings/page reviews, append-only metadata/text correction history, insertion/replacement provenance, reserved display positions and passed-page protection. It was applied locally after diagnosing the user's generic database error: PostgreSQL was healthy, but the running backend expected the missing `workflow_status` column. The batch-list and QC-queue queries succeeded after migration. Applied migration 010 is not rewritten.
+- Migration 011 adopts the latest saved per-run metadata while preserving newer manual document edits and the original run rows; empty legacy snapshots are covered. Initial document metadata status becomes `not_extracted`. It is applied locally, with a private pre-migration metadata snapshot saved under ignored `.local/backups` (not a full database/files backup). Batch-list and QC-queue queries succeed against the application schema. New test schemas are created from all migrations in isolation.
+- No database reset, original deletion, new service, Redis, Docker image or dependency was required. Apply migrations before loading updated backend code. See [DATABASE.md](DATABASE.md).
+
+### D. Lifecycle and review history
+
+One batch is one logical document across all feeder sessions. Capture status remains separate from `documents.workflow_status`: `capturing → preparing → qc_waiting → qc_in_review → awaiting_approval_l1`, or `qc_in_review → rework → preparing` on return/resubmission. Completion and OCR enqueue retain their transaction boundary. Terminal OCR enables rule extraction and queue eligibility; failed pages remain explicit review work. Returning pauses the same assigned batch. Resubmission creates another review cycle and preserves previous decisions, findings, metadata/image revisions and machine results. Decision snapshots record ordered pages, metadata, findings, page-review statuses and effective OCR/correction identities.
+
+### E. Metadata ownership, continuity and validation
+
+Current fields live on `documents.metadata_json`, not sessions or OCR jobs. Operators can save before OCR and while preparing/waiting, with independent metadata version checks. A live QC claim exclusively controls verification during review. Rules add candidates and source links without replacing human values. Original suggestions, available bounds, editor/verifier names and times, stale-source flags and candidate provenance remain visible. No invented confidence or source regions are shown. Dates and explicitly NIK-/NPWP-labelled identifiers are validated. Administrators configure required field types per document before review; metadata is not mandatory to start capture. Historical OCR-run endpoints remain readable but reject mutations with a document-workspace link/message.
+
+### F. Claims, permissions and concurrent edits
+
+Claims are persisted, exclusive and renewed for 30 minutes on successful edits or an active visible workstation heartbeat. Expired claims can be reclaimed; administrators can release a claim with a reason. Batch → document → review locks, optimistic versions, live claim ownership and CSRF checks protect mutations and decisions. The batch creator, assigned operator and every session creator are denied self-QC, including combined Administrator/Operator/QC roles. Administrator-only accounts have oversight/configuration/release, not QC decisions. Lost ownership or stale versions fail instead of silently overwriting another tab.
+
+### G. Pages, findings and safe rework
+
+QC supports rotation/reset, reorder, exclude/restore, per-page/bulk review, categorized/severity findings, resolution/waiver justification and separate human OCR text correction. Operators insert before/after a selected logical page or capture replacement candidates in the same batch. Replacement requires explicit selection/preview/confirmation; cancellation leaves the active image untouched. Unselected successful candidates and all originals remain retained. Original checksum/session/capture order are immutable; active references and recorded page revisions identify replacements. History image endpoints verify authorization and hashes. Capture/reconciliation/pending replacement blocks decisions.
+
+### H. OCR integration and pass invariants
+
+The existing PostgreSQL queue, UUID leases/fencing, retries, per-page commits and exact-success cache remain authoritative, with page concurrency **1**. Changed images/rotation invalidate old results; completed QC edits use the existing enqueue/invalidation path, and operator rework queues on resubmission. Metadata/order-only edits do not launch inference. Exact unchanged results are reused. Same-page/image/config reuse retains that page's human text correction, never another page's correction. Machine text is unchanged.
+
+Pass validates the current independent claim/version, saved ordering/completeness/metadata checklists, included pages, required/verified metadata, critical findings, needs-correction flags and original/active file integrity. Outstanding queued/running/paused OCR blocks pass even with an exception; terminal failed/missing OCR needs an explicit saved exception. The reviewed snapshot is locked against ordinary page, metadata and OCR mutations afterward. There is no administrative self-QC or approval/unlock bypass.
+
+### I. Workstation and performance scope
+
+Reused compact Ant Design and PageViewer rather than introducing a new design system. QC Queue has pagination/search/status filters. The document workstation has a 40-thumbnail window, central preview and internally scrolling Metadata/OCR Text/Page Properties/Issues/History inspector. Source links use current logical page numbers; preview supports fit-width/fit-page, zoom and fullscreen. Dirty drafts warn before navigation. Rapid page requests are fenced so an old response cannot replace another page's OCR inspector.
+
+Browser checks exposed and fixed a null source-highlight crash, inaccessible icon-inflated action names, asynchronous capture-completion races in verification, hidden inspector panes remaining visible and fixture cleanup racing preview generation. A reconciliation regression was fixed by reserving display positions independently from capture order. The 500-page check confirms bounded image rendering/navigation, not measured feeder or installed-OCR throughput.
+
+### J. Verification evidence
+
+Verification was explicitly limited to generated Simulator pages, isolated PostgreSQL schemas, mock OCR and cached Chromium. The final full suite passed **80/80**, with no failures (104.15 seconds). Additional guards cover outstanding-OCR pass protection, same-page correction reuse, combined-role self-QC and empty legacy-metadata adoption. `pnpm lint`, `pnpm format:check`, `pnpm build` and `git diff --check` passed. The mechanical UI detector returned an empty findings list. Vite retains its upstream Ant Design directive/chunk-size warnings, not build errors.
+
+Browser scenarios completed:
+
+| Scenario | Executed evidence                                                                                                  |
+| -------- | ------------------------------------------------------------------------------------------------------------------ |
+| A        | Normal ten-page capture, document navigation, claim, verification and pass                                         |
+| B        | Two 100-page feeder sessions remain one document; switching/reload preserves identity/order                        |
+| C        | Return findings, target-page navigation, previewed/confirmed replacement, insertion and second-cycle pass          |
+| D        | Human metadata entered before OCR remains after extraction; document verification and saved reload                 |
+| E        | Two browser sessions conflict on claim, release/reclaim works, backend stale/ownership checks remain authoritative |
+
+Additional checks cover a five-session/500-page document, tab visibility, historical metadata versus current editing, administration, password changes, capture isolation/recovery, viewport containment at **1920×1080, 1366×768 and 1280×720**, and browser/CSP errors. Synthetic screenshots and test logs live under `/tmp/opencode`, outside the repository. `pnpm test` bounds test-file concurrency at two to avoid PostgreSQL pool exhaustion. Exact commands and approval boundaries are in [QC.md](QC.md).
+
+At that approved checkpoint, final executions of `node test/qc-browser.check.mjs` and `node test/browser.mjs` passed after the checkpoint's fixes. `node test/metadata-browser.check.mjs` also passed against the document-owned metadata UI. The rendered 1280/1366/1920 QC layouts and 500-page screenshot were inspected; browser document scrolling and hidden-tab leakage were absent in the exercised layouts. These results do not verify subsequent UI/URL/shared-worklist changes.
+
+### K. Documentation, limitations and handoff
+
+Updated README, PRODUCT, DESIGN and DATABASE; added [QC.md](QC.md). Preserved WIA, Simulator, NAPS2 SDK 1.6.0, 300 DPI, scanner profiles, both OCR engines and historical results. No manual restart of the user's development app, physical scan, installed-engine inference or benchmark resume was performed during Phase 4 verification. No new OCR accuracy/thread-speed claim is made.
+
+This remains a single-runtime local workstation, not an internet-hardened/distributed deployment. Metadata extraction is rule-based and bounded to 200 current fields; removing a field is not a permanent suppression rule for future extraction. Completeness is an explicit officer checklist, not a forced click on every page. Physical feeder/jam/duplex behavior, production backup/restore drills, accessibility beyond the exercised keyboard/semantic controls, full mobile operation and real 500-page OCR throughput remain unverified. Apply migrations before backend updates and back up database plus managed files together. Approval/publish/search/PDF and multi-document splitting remain intentionally unimplemented.
+
+---
+
+## Historical foundation report
+
+**Delivered locally on 2026-11-13.** Authentication, administration and persistent batch capture replace the former global capture/JSON-QC workflow. The user-authorized physical test succeeded. The statements below describe that earlier delivery; the current workspace is a Git repository, and Phase 4 has not been committed or pushed.
 
 The foundation sections below retain their historical test/feature scope. **Phase 3A and its accuracy update are documented in [OCR.md](OCR.md)**; no physical scans or browser tests were run for those updates.
 
@@ -125,8 +210,8 @@ The prior global history/JSON QC behavior is intentionally **not backward compat
 - No automatic spool/preview/session/audit cleanup; monitor disk space. Missing/corrupt originals require restoration, not silent replacement. Process interruption does not establish mechanical feeder readiness.
 - Physically tested default simplex capture only. Duplex, physical jam/disconnect, repeated long batches, Windows process termination and scanner sharing across different database installations remain unverified.
 - Desktop acceptance target only; no full mobile or high-load benchmark claim. Large-page image work is serialized and thumbnail generation coalesced to reduce memory pressure, but production-scale capacity is unmeasured.
-- Table sorting is on the loaded server-paginated page. No global sorted export, backup automation, account recovery email or multi-factor authentication.
-- At initial foundation delivery, QC, approval, publication, OCR, embeddings and archive search were absent. Phase 3A adds OCR only; see [OCR.md](OCR.md). QC, approval, publication, embeddings and archive search remain absent.
+- At foundation delivery, table sorting was on the loaded server-paginated page; later QC/operator batch lists now use server sorting. No global sorted export, backup automation, account recovery email or multi-factor authentication was added by the foundation.
+- At initial foundation delivery, QC, approval, publication, OCR, embeddings and archive search were absent. Later Phase 3A added OCR and Phase 4 added metadata/QC/rework; the current status is at the top of this report. Approval, publication, embeddings and a final archive-viewer/search workflow remain unimplemented.
 
 ## K. Next-phase readiness and handoff
 
@@ -142,4 +227,4 @@ pnpm admin:bootstrap
 pnpm start
 ```
 
-Open **http://localhost:3000**. `pnpm start` requires the completed build; `pnpm dev` is the alternative, not a second simultaneous backend. Full operating instructions: [README.md](README.md). Database/security/recovery details: [DATABASE.md](DATABASE.md).
+Open **http://localhost:3000**. `pnpm start` requires the completed build; `pnpm dev` is the alternative, not a second simultaneous backend. Full operating instructions: [SETUP.md](SETUP.md). Database/security/recovery details: [DATABASE.md](DATABASE.md).

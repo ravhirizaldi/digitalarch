@@ -3,6 +3,8 @@ const routes = {
   batches: { path: '/batches', permission: 'batches:read' },
   scanner: { path: '/scanner', permission: 'batches:create' },
   ocr: { path: '/ocr', permission: 'ocr:read' },
+  qc: { path: '/qc', permission: 'qc:read' },
+  document: { path: '/documents', permission: null },
   users: { path: '/admin/users', permission: 'users:read' },
   assignments: { path: '/admin/batches', permission: 'batches:reassign' },
   audit: { path: '/admin/audit', permission: 'audit:read' },
@@ -19,6 +21,8 @@ export function matchRoute(pathname) {
     /^\/ocr\/jobs\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i,
   );
   if (job) return { view: 'ocr', batchId: null, jobId: job[1] };
+  const document = pathname.match(/^\/(?:qc|documents)\/([a-f0-9-]{36})$/i);
+  if (document) return { view: 'document', batchId: null, documentBatchId: document[1] };
   const batch = pathname.match(
     /^\/scanner\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i,
   );
@@ -27,6 +31,7 @@ export function matchRoute(pathname) {
 
 export function routePath(view, batchId = null) {
   if (view === 'ocr' && batchId) return `/ocr/jobs/${batchId}`;
+  if (view === 'document' && batchId) return `/documents/${batchId}`;
   return view === 'scanner' && batchId ? `/scanner/${batchId}` : routes[view]?.path || '/';
 }
 
@@ -39,7 +44,9 @@ export function permittedRoute(user, requested) {
       ? 'home'
       : user.permissions.includes('users:read')
         ? 'users'
-        : 'future',
+        : user.permissions.includes('qc:read')
+          ? 'qc'
+          : 'future',
     batchId: null,
   };
 }
