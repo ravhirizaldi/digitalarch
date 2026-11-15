@@ -1,5 +1,14 @@
 # DigitalArch — engineering report
 
+## Per-device reservations and independent capture (2026-11-15)
+
+- Checkpointed and pushed the preceding notifications/rework/scanner-progress work as `0d45f93` before implementation. Added scanner account scopes and a per-device FIFO coordinator in `106cf49`; `0224174` completes reservation controls, lifecycle integration and regressions.
+- Operator mode/device/profile selection is isolated by authenticated account, shared across its tabs. Real-device identity, not profile, gates acquisition. Explicit reservation/queue/release routes require permission and CSRF; queue promotion never starts a scan. Idle leases expire after 120 seconds without status heartbeats, sign-out releases them, and active captures never expire. Other devices and independent simulator workspaces can capture concurrently; OCR remains separately bounded.
+- Existing profile revision fencing, partial-page retention, Cancel-only capture, creator/ownership checks and transactional page reconciliation are preserved. Acquisition stays exclusive through reconciliation. Native discovery is inventory-only so it does not issue capability probes against another operator's device; the Windows capture helper validates capabilities while holding the reservation. Helper preparation is single-flight across account scopes.
+- Before acquisition, per-device local recovery markers are durably written; safe reconciliation removes them. Restarting with a marker quarantines that device for explicit administrator verification/recovery rather than assuming an orphaned Windows helper stopped. Idle queue/selection state intentionally resets across backend restarts. No migration, dependency, Redis, service deployment or LAN/security changes.
+- Added unexecuted coordinator/fleet/API regressions for FIFO/expiry, same-device exclusion, parallel devices/operators, account-scoped cancellation, permission/CSRF checks and restart quarantine. No tests, browser checks, hardware queries, scans or OCR verification were run. Actual Windows driver concurrency and rendered behavior require separate approval and acceptance.
+- ESLint, Prettier, frontend build, `git diff --check` and the static UI detector passed. The Windows scanner helper compiled with zero warnings/errors; it was not invoked or deployed. No backend restart, migration or OCR execution was performed.
+
 ## Cancel-only scan progress (2026-11-15)
 
 - Added a nondismissible modal with live saved-page counts, an inert application shell and Cancel scan as the only action. Preparing/waiting/stopping/finalizing states do not invent a feeder total. Cancellation during preparation is queued or prevents an unsent capture request. A browser-unload warning complements existing navigation guards; browser/OS actions cannot be prohibited.

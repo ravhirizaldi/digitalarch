@@ -118,7 +118,15 @@ Run `pnpm db:migrate` **before** running updated backend code. Migration 010 add
 | `pnpm db:down`                    | Stop the database; retain its volume     |
 | `pnpm lint` / `pnpm format:check` | Static checks                            |
 
-Run only one backend per database/scanner; do not run dev and production together. OCR tests/benchmarks (including `pnpm test`), browser tests and physical scans require explicit user approval before an agent runs them.
+Run only one backend per capture host/database; do not run dev and production together. OCR tests/benchmarks (including `pnpm test`), browser tests and physical scans require explicit user approval before an agent runs them.
+
+## Shared scanners and reservations
+
+Each operator selects their own mode/device/profile in Scanner. For real hardware, choose **Reserve / join queue** before loading paper. A busy device has its own FIFO queue; other scanners remain independent. When **Scanner reserved for you** appears, load the correct document and explicitly choose **Scan feeder**. Promotion never starts a scan automatically. **Release scanner** hands it to the next waiting operator; **Leave queue** cancels waiting. Release before changing device/profile/mode. Idle reservations and waiting entries expire after two minutes without authenticated status polling; sign-out releases them. Tabs signed into the same account share one selection and reservation. Selections/idle queues reset on backend restart. Simulator sessions are per-operator and need no real-device reservation.
+
+Active and unconfirmed captures never expire, including during database failures; exclusivity continues through page registration. Independent helper processes can acquire different WIA device IDs, but simultaneous real-scanner behavior requires explicit driver/hardware acceptance. Discovery only enumerates inventory; capability checks occur inside reserved capture. OCR remains separately queued with page concurrency one. This does **not** enable LAN access or HTTPS: the existing loopback-only deployment remains in place.
+
+Before a real capture starts, DigitalArch writes a per-device recovery marker under `DIGITALARCH_DATA_DIR/scanner-active` (default `.local/scanner-active`). It removes it only after safe process completion and saved-page reconciliation. After an unexpected backend restart, any remaining marker locks that device for administrator recovery, even if database recovery marks its session interrupted. **Do not clear markers merely to unlock a scanner.** Stop the backend, verify the identified Windows helper process and physical device have stopped, inspect/recover retained spool output, then remove only that device's marker JSON (its contents identify `key` and session UUID `jobId`) and restart the backend. Other device markers must remain untouched. Preserve markers with recovery backups; no automated timeout can prove that an orphaned helper stopped.
 
 ## Storage and deployment
 

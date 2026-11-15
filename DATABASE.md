@@ -1,5 +1,11 @@
 # Database, storage and local operations
 
+## Per-device capture coordination
+
+Scanner selection and idle reservation/FIFO queues are account-scoped runtime state, not a second archival workflow or a new database table. Existing scan-session provenance stores device/profile/revision and operator identity. A real device is exclusive across profiles and operators until its provider settles and the existing page-registration transaction completes. Different devices may acquire independently; OCR concurrency and batch/document locks are unchanged. No database migration is required for this change.
+
+Durable `.local/scanner-active` markers (or the configured data directory) quarantine unresolved devices after restart; idle reservations/queues reset. Retain these alongside recovery spools in backups. Database recovery marking an interrupted session is not evidence that a Windows process or scanner stopped. See **Shared scanners and reservations** in [SETUP.md](SETUP.md) for the explicit administrator recovery procedure. No scan, OCR or runtime verification was performed for this feature.
+
 ## Verified Docker preflight
 
 Executed before provisioning:

@@ -6,6 +6,7 @@ A local document digitization app for Windows + WSL2. Capture paper documents, r
 
 - Real scanner capture through NAPS2/WIA, plus a simulator.
 - Multi-session batches with pause, resume and recovery.
+- Operator-specific scanner selections, exclusive per-device reservations and FIFO waiting queues.
 - Tesseract OCR and optional PaddleOCR.
 - Metadata verification, QC findings and operator rework.
 - Role-based access and an audit trail.

@@ -55,7 +55,9 @@ flowchart LR
 
 React/Vite and the backend run in WSL2 for the supported development setup. The browser, WIA driver and Windows helpers run on Windows. PostgreSQL uses the existing local Docker image with pulls disabled. Production serves the built frontend from Node; development uses the origin-preserving proxy. There is no Redis, separate OCR service, cloud storage or second workflow database. pgvector is installed but embeddings are not implemented.
 
-One runtime holds a database/schema advisory lock; a second runtime cannot begin capture/recovery. Physical capture is globally serialized. OCR page concurrency is fixed at one; supported Paddle thread budgets are not page concurrency.
+One runtime holds a database/schema advisory lock; a second runtime cannot begin capture/recovery. `scanner-fleet.mjs` isolates operator selections and dispatches independent per-device captures. `reservations.mjs` maintains exclusive real-device ownership/FIFO waiting lists, keyed by WIA device identity rather than profile. Capability checks happen inside reserved acquisition; discovery is inventory-only. OCR page concurrency remains fixed at one; supported Paddle thread budgets are not page concurrency. Parallel physical acquisition depends on driver support and remains runtime-unverified. Loopback/HTTPS/LAN configuration is unchanged.
+
+`POST /api/scanner/reserve` and `/api/scanner/release` accept an empty body with scanner-scan permission/CSRF; no caller-supplied user or device overrides. Existing mode/refresh/status endpoints act on the authenticated account's selection, shared across its tabs. Status includes caller-relative reservation state and per-device availability. Each operator may hold or wait for only one real device. Waiting does not schedule an unattended scan: the operator must explicitly start after ownership. Idle entries expire after 120 seconds without authenticated status heartbeats or release on sign-out; captures remain exclusive through transactional page registration. Simulator captures are isolated per operator without real-device reservations. Queue/selection state is intentionally process-local; unresolved real acquisitions persist as restart quarantine markers (see SETUP.md).
 
 ## 3. Source ownership
 
@@ -66,6 +68,7 @@ One runtime holds a database/schema advisory lock; a second runtime cannot begin
 | Database pool, transactions, migrations                | `server/db.mjs`, `migrations/`                                                                     |
 | Authentication, permissions, users and role separation | `server/auth.mjs`                                                                                  |
 | Capture/session/rework orchestration                   | `server/batches.mjs`, `bridge.mjs`, `DigitalArch.Service/`                                         |
+| Operator scanner scopes and per-device queues          | `server/scanner/scanner-fleet.mjs`, `server/scanner/reservations.mjs`                              |
 | Original validation, revisions and derivatives         | `server/capture-storage.mjs`, `server/storage.mjs`                                                 |
 | OCR queue, leases, adapters and settings               | `server/ocr.mjs`, `server/ocr-provider.mjs`, `server/ocr-engines.mjs`, `server/ocr-paddle.mjs`     |
 | Rules and current/historical metadata                  | `server/metadata-extract.mjs`, `server/qc-metadata.mjs`, `server/document-metadata.mjs`            |
