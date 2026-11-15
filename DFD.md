@@ -1,6 +1,6 @@
 # Data flow diagrams
 
-**Source baseline: 2026-11-15.** These Mermaid diagrams describe capture/OCR/QC, approval and viewer flows through migration 017. They are source-derived documentation, not evidence of new runtime verification. [APPROVAL.md](APPROVAL.md) defines approval policy, scoped Documents and QR receipts; [VIEWER.md](VIEWER.md) defines registration, administrator authorization and published-image/PDF access.
+**Source baseline: 2026-11-15.** These diagrams describe capture/OCR/QC, approval, viewer and staff notification flows through migration 019. They are source-derived, not new runtime verification. See [APPROVAL.md](APPROVAL.md), [VIEWER.md](VIEWER.md) and [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 ## 1. System context
 
@@ -108,6 +108,29 @@ flowchart TB
     P6 <--> F3
     P6 -->|scoped JSON and image responses| Browser
 ```
+
+### Staff notification delivery
+
+```mermaid
+sequenceDiagram
+    participant W as Workflow API
+    participant D as PostgreSQL
+    participant N as Shared Node listener
+    participant B as Staff navbar inbox
+    W->>D: Begin, validate and change workflow, insert audit
+    D->>D: Filtered trigger inserts event and eligible recipients
+    W->>D: Commit
+    D-->>N: NOTIFY recipient IDs after commit
+    N-->>B: Coalesced authenticated SSE invalidation
+    B->>W: Fetch own summary or bounded keyset page
+    W->>D: Indexed recipient reads with current document scopes
+    W-->>B: Own notifications, stage and authorized destinations
+    B->>W: Mark own notification read, unread or viewed
+    W->>D: Update own recipient state
+    D-->>N: Wake other tabs for that recipient
+```
+
+No Redis or per-browser database connection is needed: LISTEN shares the runtime-lock connection. Durable rows survive missed wake-ups; reconnect/focus refreshes catch up. SSE carries no document content. Notification reads never change document decisions. The existing local preparation guidance and Viewer transfer notice remain separate.
 
 ### Data handling rules
 

@@ -189,6 +189,14 @@ ul {
   border: 1px solid #d8dee7;
   border-radius: 4px;
 }
+.batch-info-fields {
+  width: 100%;
+}
+.qc-submit-reason {
+  max-width: 320px;
+  white-space: normal;
+  font-size: 12px;
+}
 .toolbar-spacer {
   flex: 1;
 }
@@ -460,6 +468,19 @@ ul {
 .status-bar > span:last-child {
   margin-left: auto;
   flex-shrink: 0;
+}
+.document-footer-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+}
+.document-footer-status .ant-tag {
+  margin: 0;
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 18px;
 }
 .fill-width {
   width: 100%;

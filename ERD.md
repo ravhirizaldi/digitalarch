@@ -1,6 +1,6 @@
 # Entity relationship diagrams
 
-**Source baseline: 2026-11-15, migrations 001–017.** These diagrams describe source, not a fresh inspection of a running database. Selected columns are shown; SQL migrations remain authoritative. Approval decisions and the approved-viewer library are implemented in source. See [APPROVAL.md](APPROVAL.md) and [VIEWER.md](VIEWER.md).
+**Source baseline: 2026-11-15, migrations 001–019.** These diagrams describe source, not a fresh inspection of a running database. Selected columns are shown; SQL migrations remain authoritative. See [APPROVAL.md](APPROVAL.md), [VIEWER.md](VIEWER.md) and [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 ## 1. Accounts, roles and sessions
 
@@ -369,6 +369,42 @@ erDiagram
 Policy is fixed at first QC Pass; its integer version is a historical value, not a foreign key to the singleton's changing version. Decisions are append-only and unique on `(qc_review_id,level)`. Reasons are mandatory for returns/drops. QR images are generated from the decision ID; they are not stored document copies or access tokens. Dismissing a notice does not delete its decision.
 
 Migration 018 adds append-only publication takedowns with required reasons and unique source/resumed reviews. A QC destination creates an undecided review; an L1 destination carries the signed QC result via `carried_from_review_id` into a new cycle without copying old approval decisions. Publication fields clear in the same transaction. No files or original history are deleted.
+
+## Staff notification inbox (migration 019)
+
+```mermaid
+erDiagram
+    audit_logs ||--o| staff_notification_events : creates_atomically
+    archive_batches ||--o{ staff_notification_events : contextualizes
+    documents ||--o{ staff_notification_events : concerns
+    users o|--o{ staff_notification_events : acts
+    approval_decisions o|--o{ staff_notification_events : references
+    staff_notification_events ||--o{ staff_notification_recipients : delivers
+    users ||--o{ staff_notification_recipients : reads
+    staff_notification_events {
+        BIGINT id PK
+        UUID audit_id FK, UK
+        UUID batch_id FK
+        UUID document_id FK
+        UUID actor_id FK
+        UUID decision_id FK
+        INTEGER review_cycle
+        TEXT action
+        TEXT actor_name
+        TEXT title
+        TEXT batch_code
+        TEXT reason
+        TIMESTAMPTZ created_at
+    }
+    staff_notification_recipients {
+        UUID user_id PK, FK
+        BIGINT event_id PK, FK
+        TIMESTAMPTZ read_at
+        TIMESTAMPTZ viewed_at
+    }
+```
+
+Events are append-only; user/event uniqueness prevents multi-role duplicates. The composite primary key supports backward keyset paging; a partial unread index avoids scanning read history for badges. Read state is mutable per user and does not complete workflow tasks. Transition-table statement triggers issue commit-time recipient-ID NOTIFY wake-ups, not document payloads. Legacy approval reads remain retained; see [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 ## 5. Migration ledger and retention
 

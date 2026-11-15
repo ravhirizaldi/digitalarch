@@ -622,7 +622,7 @@ test('batch deletion: ownership, permissions, CSRF, stale versions and running-s
   assert.equal(started.status, 200);
   assert.equal(
     (await operator.request(route, { version: started.body.batch.version })).body.code,
-    'session_running',
+    'scan_in_progress',
   );
   const finished = await until(async () => {
     const current = (await operator.request(`/api/batches/${batch.id}`)).body;
@@ -835,7 +835,7 @@ test('page corrections: owner permissions, CSRF, validation and active-capture g
   assert.equal(
     (await operator.request(route, { ...body, version: started.body.batch.version }, 'PATCH')).body
       .code,
-    'session_running',
+    'scan_in_progress',
   );
   await until(
     async () =>

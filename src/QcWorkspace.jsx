@@ -50,6 +50,7 @@ import { dateTime, IconButton, Thumbnail } from './ui';
 import WorklistTable, { BatchIdentity, BatchIdHeading, ColumnHeading } from './WorklistTable';
 import PageViewer from './PageViewer';
 import PageLabelEditor from './PageLabelEditor';
+import BatchInfo from './BatchInfo';
 import { pageName } from './pageLabels';
 import MetadataPanel, { metadataTypeLabels } from './MetadataPanel';
 import { queryChoice, queryPage, queryZoom, useUrlState } from './useUrlState';
@@ -579,6 +580,8 @@ export default function QcWorkspace({
   const [decision, setDecision] = useState(null);
   const [reason, setReason] = useState('');
   const [requiredMetadata, setRequiredMetadata] = useState([]);
+  const [batchInfo, setBatchInfo] = useState(null);
+  const [batchInfoError, setBatchInfoError] = useState('');
   const can = (permission) => user.permissions.includes(permission);
   const canReview = user.permissions.includes('qc:review');
   const review = data?.reviews[0];
@@ -591,7 +594,8 @@ export default function QcWorkspace({
     mine ||
     (operator &&
       ['capturing', 'operator_preparation', 'rework'].includes(data?.document.workflow_status));
-  const dirty = metadataDirty || reviewDirty || textDirty;
+  const batchInfoDirty = batchInfo && batchInfo.location !== batchInfo.originalLocation;
+  const dirty = metadataDirty || reviewDirty || textDirty || !!batchInfoDirty;
   useEffect(() => {
     const key = `document-workflow-${batchId}`;
     return () => notification.destroy(key);
@@ -604,62 +608,19 @@ export default function QcWorkspace({
       ocrStatus,
     );
     let notice;
-    if (operator && ['operator_preparation', 'rework'].includes(workflow)) {
-      const send = workflow === 'rework' ? 'Resubmit to QC' : 'Send to QC';
+    if (operator && workflow === 'operator_preparation') {
+      const send = 'Send to QC';
       notice = {
         type: ['paused', 'failed', 'cancelled', 'completed_with_errors'].includes(ocrStatus)
           ? 'warning'
           : 'info',
-        title: workflow === 'rework' ? 'Not resubmitted to QC' : 'Not sent to QC',
+        title: 'Not sent to QC',
         description:
           data.batch.status !== 'capture_completed'
             ? 'Finish capture first, then wait for OCR and resubmit to QC.'
             : !finished
               ? `OCR ${label(ocrStatus || 'not_queued')}. Wait for completion, or resume paused OCR in the OCR workspace.`
               : `${ocrStatus !== 'completed' ? 'OCR finished with warnings. ' : ''}Editing is optional. ${send} when ready; QC can fill any gaps.`,
-      };
-    } else if (workflow === 'qc_waiting' || (operator && workflow === 'preparing')) {
-      notice = {
-        type: 'info',
-        title: operator ? 'Sent to QC' : 'Waiting for QC',
-        description: operator
-          ? 'Waiting for a reviewer. Operator edits are locked until QC returns the document.'
-          : 'Claim document before making corrections. Fill missing metadata and review the pages before QC Pass.',
-      };
-    } else if (
-      ['awaiting_approval_l1', 'awaiting_approval_l2', 'approved', 'dropped'].includes(workflow)
-    ) {
-      notice = {
-        type: 'info',
-        title: label(workflow),
-        description:
-          workflow === 'dropped'
-            ? 'This batch was closed without publication. Originals and history are retained.'
-            : workflow === 'approved'
-              ? 'Publication was explicitly confirmed. The reviewed revision remains locked.'
-              : 'The reviewed revision is locked. Approval decisions are available in the Documents registry and approval queues.',
-      };
-    } else if (workflow === 'qc_in_review' && !mine) {
-      notice = {
-        type: 'info',
-        title: 'Read-only review',
-        description: `${review?.reviewer || 'QC Officer'} · Claim expires ${dateTime(review?.claim_expires_at)}`,
-      };
-    }
-    if (['qc_waiting', 'qc_in_review'].includes(workflow) && review?.approval_return_reason) {
-      notice = {
-        type: 'warning',
-        title: 'Returned from approval',
-        description: `${review.approval_return_reason}\n\nAssigned to ${review.assigned_reviewer || 'the QC queue'}. A new QC Pass and fresh approval decisions are required.`,
-      };
-    }
-    if (workflow === 'rework') {
-      notice = {
-        ...notice,
-        type: 'warning',
-        title: 'Returned by QC',
-        description: `${review?.decision_reason || 'Review findings'}${notice ? `\n\n${notice.description}` : ''}`,
-        actions: <Button onClick={() => setViewState({ tab: 'issues' })}>View findings</Button>,
       };
     }
     const key = `document-workflow-${batchId}`;
@@ -730,9 +691,23 @@ export default function QcWorkspace({
   }, [operator, dirty, working, load]);
   useEffect(() => {
     if (data) {
+      const included = data.pages.filter((p) => !p.is_excluded && !p.replacement_candidate);
+      const reviewed = included.filter(
+        (p) => p.review_status === 'reviewed' && p.reviewed_image_revision === p.image_revision,
+      ).length;
+      const findings = data.findings.filter(
+        (f) => !['resolved', 'waived'].includes(f.status),
+      ).length;
+      const unsent = data.document.workflow_status === 'operator_preparation';
       onStatusChange({
         batchId,
-        text: `${data.pages.filter((p) => !p.is_excluded && !p.replacement_candidate).length} included pages · ${data.pages.filter((p) => p.review_status === 'reviewed' && p.reviewed_image_revision === p.image_revision).length} reviewed · ${data.findings.filter((f) => !['resolved', 'waived'].includes(f.status)).length} unresolved findings · ${data.document.workflow_status === 'operator_preparation' ? 'Not sent to QC' : `Cycle ${data.document.review_cycle}`} · Revision ${data.document.revision}`,
+        text: `${included.length} included pages · ${reviewed} reviewed · ${findings} unresolved findings · ${unsent ? 'Not sent to QC' : `Cycle ${data.document.review_cycle}`} · Revision ${data.document.revision}`,
+        included: included.length,
+        reviewed,
+        findings,
+        cycle: data.document.review_cycle,
+        revision: data.document.revision,
+        unsent,
       });
     }
     return () => onStatusChange(null);
@@ -913,6 +888,24 @@ export default function QcWorkspace({
       setWorking(false);
     }
   }
+  async function saveBatchInfo() {
+    if (!batchInfo || working || !locationEditable) return;
+    setWorking(true);
+    setBatchInfoError('');
+    try {
+      await api(
+        `/api/batches/${batchId}`,
+        { version: batchInfo.version, physicalLocation: batchInfo.location },
+        'PATCH',
+      );
+      setBatchInfo(null);
+      await load();
+    } catch (error) {
+      setBatchInfoError(error.message);
+    } finally {
+      setWorking(false);
+    }
+  }
   function keyDown(e) {
     lastInteraction.current = Date.now();
     if (
@@ -943,13 +936,28 @@ export default function QcWorkspace({
     ['in_progress', 'paused'].includes(data.batch.status) &&
     ['capturing', 'rework'].includes(data.document.workflow_status);
   const pageMutable = editable;
+  const locks = data.operator_locks;
+  const pageProtected = !mine && locks?.reviewedPageIds.includes(page?.id);
+  const orderingEditable = editable && (mine || !locks?.orderingLocked);
+  const membershipEditable = orderingEditable && (mine || !locks?.completenessLocked);
+  const locationEditable = editable && (mine || !locks?.locationLocked);
   const preparing =
     operator && ['operator_preparation', 'rework'].includes(data.document.workflow_status);
   const ocrFinished = ['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(
     data.batch.ocr_status,
   );
   const sendLabel = data.document.workflow_status === 'rework' ? 'Resubmit to QC' : 'Send to QC';
-  const sendBlocked = dirty || working || data.batch.status !== 'capture_completed' || !ocrFinished;
+  const captureReady =
+    data.batch.status === 'capture_completed' ||
+    (data.can_resubmit_without_capture && ['in_progress', 'paused'].includes(data.batch.status));
+  const sendBlockReason = dirty
+    ? 'Save your edits before sending to QC.'
+    : !captureReady
+      ? 'Complete capture for new or changed page images.'
+      : !ocrFinished
+        ? 'Wait for OCR to finish.'
+        : '';
+  const sendBlocked = working || !!sendBlockReason;
   const ocr = pageInfo?.ocr;
   const processing = ocr?.processing_config;
   const notes = (
@@ -1002,7 +1010,7 @@ export default function QcWorkspace({
       {['ordering_reviewed', 'completeness_reviewed', 'metadata_reviewed'].map((key) => (
         <Checkbox
           key={key}
-          disabled={!mine}
+          disabled={!mine || working}
           checked={draft?.[key]}
           onChange={(e) => {
             setDraft({ ...draft, [key]: e.target.checked });
@@ -1020,7 +1028,7 @@ export default function QcWorkspace({
         aria-label="Review notes"
         placeholder="Review notes"
         value={draft?.notes || ''}
-        readOnly={!mine}
+        disabled={!mine || working}
         onChange={(e) => {
           setDraft({ ...draft, notes: e.target.value });
           setReviewDirty(true);
@@ -1036,7 +1044,7 @@ export default function QcWorkspace({
         aria-label="OCR exception justification"
         placeholder="OCR exception justification (only if needed)"
         value={draft?.ocr_exception || ''}
-        readOnly={!mine}
+        disabled={!mine || working}
         maxLength={2000}
         autoSize={{ minRows: 2, maxRows: 5 }}
         onChange={(e) => {
@@ -1055,7 +1063,7 @@ export default function QcWorkspace({
           key={batchId}
           job={{ id: batchId, status: 'completed' }}
           metadataPath={`/api/batches/${batchId}/metadata`}
-          canManage={editable}
+          canManage={editable && (mine || !locks?.metadataLocked)}
           canVerify={mine}
           refreshVersion={data.metadata.version}
           pageNames={Object.fromEntries(data.pages.map((p) => [p.id, pageName(p)]))}
@@ -1256,23 +1264,26 @@ export default function QcWorkspace({
                       label="Move page up"
                       icon={<ArrowUpOutlined aria-hidden />}
                       onClick={() => pageAction('reorder', visible[Math.max(0, index - 1)]?.id)}
-                      disabled={index <= 0}
+                      disabled={!orderingEditable || working || index <= 0}
                     />
                     <IconButton
                       label="Move page down"
                       icon={<ArrowDownOutlined aria-hidden />}
                       onClick={() => pageAction('reorder', visible[index + 2]?.id || null)}
-                      disabled={index < 0 || index >= visible.length - 1}
+                      disabled={
+                        !orderingEditable || working || index < 0 || index >= visible.length - 1
+                      }
                     />
                     <IconButton
                       label="Reset rotation"
                       icon={<UndoOutlined aria-hidden />}
-                      disabled={working || !page.rotation_degrees}
+                      disabled={working || pageProtected || !page.rotation_degrees}
                       onClick={() => pageAction('reset-rotation')}
                     />
                     <Select
                       aria-label="Move selected page before"
                       placeholder="Move before page…"
+                      disabled={!orderingEditable || working}
                       showSearch
                       optionFilterProp="label"
                       value={null}
@@ -1506,6 +1517,11 @@ export default function QcWorkspace({
         >
           {label(data.document.workflow_status)}
         </Tag>
+        {preparing && sendBlockReason && (
+          <Tag color="warning" className="qc-submit-reason" role="status">
+            {sendBlockReason}
+          </Tag>
+        )}
         <span className="toolbar-spacer" />
         <IconButton
           label="Reload"
@@ -1518,6 +1534,19 @@ export default function QcWorkspace({
             }
           }}
         />
+        <Button
+          disabled={dirty || working}
+          onClick={() => {
+            setBatchInfoError('');
+            setBatchInfo({
+              version: data.batch.version,
+              location: data.batch.physical_location || '',
+              originalLocation: data.batch.physical_location || '',
+            });
+          }}
+        >
+          Batch Info
+        </Button>
         {captureMutable && (
           <Button disabled={dirty || working} onClick={() => onCapture(data.batch, page?.id)}>
             Capture / rework
@@ -1526,7 +1555,7 @@ export default function QcWorkspace({
         {preparing && (
           <Popconfirm
             title={`${sendLabel}?`}
-            description="Editing is optional. QC will fill missing metadata and review the pages. Sending locks operator edits until QC returns the document."
+            description="Existing images and OCR are reused when pages are unchanged. Sending locks operator edits until QC returns the document."
             okText={sendLabel}
             cancelText="Keep preparing"
             disabled={sendBlocked}
@@ -1536,7 +1565,7 @@ export default function QcWorkspace({
               icon={<SendOutlined aria-hidden />}
               type="primary"
               disabled={sendBlocked}
-              title={dirty ? 'Save your edits before sending to QC.' : undefined}
+              title={sendBlockReason || undefined}
             >
               {sendLabel}
             </Button>
@@ -1728,20 +1757,20 @@ export default function QcWorkspace({
                   <PageLabelEditor
                     key={page.id}
                     page={page}
-                    disabled={working || dirty}
+                    disabled={working || dirty || pageProtected}
                     error={error}
                     onSave={(label) => pageAction('rename', undefined, label)}
                   />
                   <IconButton
                     label="Rotate left"
                     icon={<RotateLeftOutlined aria-hidden />}
-                    disabled={working}
+                    disabled={working || pageProtected}
                     onClick={() => pageAction('rotate-left')}
                   />
                   <IconButton
                     label="Rotate right"
                     icon={<RotateRightOutlined aria-hidden />}
-                    disabled={working}
+                    disabled={working || pageProtected}
                     onClick={() => pageAction('rotate-right')}
                   />
                   <Popconfirm
@@ -1751,6 +1780,7 @@ export default function QcWorkspace({
                         : 'Exclude page without deleting the original?'
                     }
                     onConfirm={() => pageAction(page.is_excluded ? 'restore' : 'exclude')}
+                    disabled={working || pageProtected || !membershipEditable}
                   >
                     <IconButton
                       label={page.is_excluded ? 'Restore page' : 'Exclude page'}
@@ -1762,7 +1792,7 @@ export default function QcWorkspace({
                         )
                       }
                       danger={!page.is_excluded}
-                      disabled={working}
+                      disabled={working || pageProtected || !membershipEditable}
                     />
                   </Popconfirm>
                 </Space>
@@ -1798,7 +1828,9 @@ export default function QcWorkspace({
                 !revisionId &&
                 sourceHighlight &&
                 sourceHighlight.pageId === page?.id &&
-                sourceHighlight.resultId === pageInfo?.ocr?.result_id
+                [pageInfo?.ocr?.result_id, pageInfo?.ocr?.source_result_id].includes(
+                  sourceHighlight.resultId,
+                )
                   ? {
                       bounds: sourceHighlight.bounds,
                       pageWidth: pageInfo?.ocr?.structured_result?.pageBounds?.width,
@@ -1874,7 +1906,9 @@ export default function QcWorkspace({
         <p>
           {decision === 'pass'
             ? 'The backend validates integrity, metadata, OCR and the saved checklist, then locks this revision.'
-            : 'A reason is required and will remain in history.'}
+            : decision === 'return'
+              ? 'A reason is required. Before returning, save unchecked review boxes for sections the operator must change, reopen protected metadata fields, and mark reviewed pages needing changes as Needs correction. Checked sections and reviewed pages remain protected.'
+              : 'A reason is required and will remain in history.'}
         </p>
         <Input.TextArea
           aria-label="QC decision reason"
@@ -1883,6 +1917,19 @@ export default function QcWorkspace({
           onChange={(e) => setReason(e.target.value)}
         />
       </Modal>
+      <BatchInfo
+        open={!!batchInfo}
+        onClose={() => {
+          if (!working && (!batchInfoDirty || window.confirm('Discard unsaved batch information?')))
+            setBatchInfo(null);
+        }}
+        location={batchInfo?.location || ''}
+        onChange={(location) => setBatchInfo((old) => ({ ...old, location }))}
+        onSave={saveBatchInfo}
+        saving={working}
+        editable={locationEditable}
+        error={batchInfoError}
+      />
       <Modal
         title={issue?.id ? 'Update finding' : 'Add finding'}
         open={!!issue}

@@ -7,16 +7,14 @@ import {
   Button,
   Checkbox,
   ConfigProvider,
-  Drawer,
   Empty,
-  Input,
   Layout,
   Menu,
   Modal,
   Popconfirm,
   Progress,
-  Space,
   Spin,
+  Space,
   Tag,
 } from 'antd';
 import {
@@ -28,6 +26,10 @@ import {
   SettingOutlined,
   TeamOutlined,
   UserOutlined,
+  CheckCircleOutlined,
+  ExclamationCircleOutlined,
+  HistoryOutlined,
+  AuditOutlined,
 } from '@ant-design/icons';
 import { enterpriseTheme } from './theme';
 import { api, setCsrfToken } from './api';
@@ -37,7 +39,8 @@ import ScannerSettings from './ScannerSettings';
 import ScannerWorkspace from './ScannerWorkspace';
 import AuthScreen from './AuthScreen';
 import BatchList from './BatchList';
-import { ApprovalNotifications } from './ApprovalConfirmation';
+import BatchInfo from './BatchInfo';
+import StaffNotifications from './StaffNotifications';
 import './style.css';
 
 const Administration = lazy(() => import('./Administration'));
@@ -77,12 +80,26 @@ function DigitalArchApp() {
   const [complete, setComplete] = useState(false);
   const [acknowledge, setAcknowledge] = useState(false);
   const [changingPassword, setChangingPassword] = useState(false);
+  const [cancellingScan, setCancellingScan] = useState(false);
+  const cancelBeforeCapture = useRef(false);
+  const [cancelledSession, setCancelledSession] = useState(null);
   const user = identity?.user;
   const can = useCallback((permission) => !!user?.permissions.includes(permission), [user]);
   const operational = can('batches:create');
-  const scanning = active?.sessions.some((session) => session.status === 'running');
+  const activeCapture = active?.sessions.find(
+    (session) => session.status === 'running' && session.created_by === user?.id,
+  );
+  const capture = scanner.capture?.created_by === user?.id ? scanner.capture : activeCapture;
+  const scanLocked = !!capture || working === 'scan';
+  const stoppingScan = !!capture && (capture.cancelRequested || cancelledSession === capture.id);
+  const finalizingScan =
+    !!capture?.jobStatus && !['scanning', 'unknown'].includes(capture.jobStatus);
+  const capturedPages = Math.max(
+    capture?.page_count || 0,
+    activeCapture?.id === capture?.id ? activeCapture?.page_count || 0 : 0,
+  );
   const locked = active && !['in_progress', 'paused'].includes(active.batch.status);
-  const busy = !!working || scanning || scanner.busy || scanner.checking;
+  const busy = !!working || scanLocked || scanner.busy || scanner.checking;
   const ocrFooter = view === 'ocr' && ocrStatus?.jobId === ocrJobId ? ocrStatus : null;
   const partial = active?.sessions.some((session) =>
     ['partial', 'interrupted'].includes(session.status),
@@ -136,7 +153,7 @@ function DigitalArchApp() {
     return () => window.removeEventListener('digitalarch:url-state', remember);
   }, []);
   const restoreRoute = useCallback(
-    async (account, requested = matchRoute(window.location.pathname)) => {
+    async (account, requested = matchRoute(window.location.pathname), replace = true) => {
       const route = permittedRoute(account, requested);
       setWorking('restore');
       setError('');
@@ -156,15 +173,16 @@ function DigitalArchApp() {
             if (Number.isInteger(session.settings_snapshot?.pageDelay))
               setPageDelay(session.settings_snapshot.pageDelay);
           }
-          showView('scanner', result.batch.id, true);
+          showView('scanner', result.batch.id, replace);
         } else {
           clearBatch();
           showView(
             route.view,
             route.jobId || route.documentBatchId || route.recordId || route.confirmationId || null,
-            true,
+            replace,
           );
         }
+        return true;
       } catch (error) {
         setError(error.message);
         clearBatch();
@@ -224,7 +242,7 @@ function DigitalArchApp() {
       }
     }
   }, [can, clearBatch, showView]);
-  const hasActive = !!active;
+  const hasActive = !!active || !!capture;
   useEffect(() => {
     if (!user || user.must_change_password) return;
     refresh();
@@ -236,6 +254,15 @@ function DigitalArchApp() {
     );
     return () => clearInterval(timer);
   }, [user, refresh, hasActive]);
+  useEffect(() => {
+    if (!scanLocked) return;
+    const warn = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [scanLocked]);
   useEffect(() => {
     if (!user || user.must_change_password) return;
     const pop = async () => {
@@ -274,7 +301,7 @@ function DigitalArchApp() {
   }, [user, busy, active, locked, view, ocrJobId, documentBatchId, ocrMetadataDirty, restoreRoute]);
 
   async function run(label, operation) {
-    if (working) return;
+    if (working || scanLocked) return;
     setWorking(label);
     setError('');
     try {
@@ -331,6 +358,19 @@ function DigitalArchApp() {
     navigate(route);
   }
   const openConfirmation = (id) => navigate('confirmation', id);
+  async function openNotification(destination) {
+    if (busy || !destination) return false;
+    if (ocrMetadataDirty && !window.confirm('Discard unsaved document edits?')) return false;
+    return await run('open-notification', async () => {
+      if (
+        active &&
+        !locked &&
+        (destination.view !== 'scanner' || active.batch.id !== destination.id)
+      )
+        await api(`/api/batches/${active.batch.id}/pause`, { version: active.batch.version });
+      return restoreRoute(user, matchRoute(routePath(destination.view, destination.id)), false);
+    });
+  }
   function backFromRecord() {
     const returnTo = new URLSearchParams(window.location.search).get('returnTo');
     const origin = returnTo?.split('?')[0];
@@ -352,6 +392,7 @@ function DigitalArchApp() {
           setActive(target);
           showView('scanner', target.batch.id);
         }
+        if (cancelBeforeCapture.current) return;
         const result = await api(`/api/batches/${target.batch.id}/scan-sessions`, {
           version: target.batch.version,
           options: body.options || body,
@@ -364,10 +405,45 @@ function DigitalArchApp() {
             : {}),
         });
         if (activeId.current === result.batch.id) setActive(result);
+        if (cancelBeforeCapture.current) {
+          const session = result.sessions.find((session) => session.status === 'running');
+          if (session) {
+            await api(`/api/batches/${target.batch.id}/cancel-scan`, { sessionId: session.id });
+            setCancelledSession(session.id);
+          }
+        }
       } else setScanner(await api(`/api/scanner/${route}`, body));
       await refresh();
     });
+    if (cancelBeforeCapture.current) {
+      cancelBeforeCapture.current = false;
+      setCancellingScan(false);
+    }
     setRequestedMode(null);
+  }
+  async function cancelScan() {
+    if (cancellingScan || stoppingScan || finalizingScan) return;
+    if (!capture) {
+      if (working === 'scan') {
+        cancelBeforeCapture.current = true;
+        setCancellingScan(true);
+      }
+      return;
+    }
+    setCancellingScan(true);
+    setError('');
+    try {
+      const result = await api(`/api/batches/${capture.batch_id}/cancel-scan`, {
+        sessionId: capture.id,
+      });
+      setCancelledSession(capture.id);
+      if (activeId.current === result.batch.id) setActive(result);
+      await refresh();
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setCancellingScan(false);
+    }
   }
   const changePage = (page, action, label) =>
     run('page', async () => {
@@ -400,6 +476,7 @@ function DigitalArchApp() {
       page_label: page.page_label,
       capture_order: page.capture_order,
       replacement_candidate: page.replacement_candidate,
+      qcProtected: active.operator_locks?.reviewedPageIds.includes(page.id),
       rotation: page.rotation_degrees,
       excluded: page.is_excluded,
       sessionId: page.scan_session_id,
@@ -471,7 +548,7 @@ function DigitalArchApp() {
   if (!user) return <AuthScreen onAuthenticated={authenticated} initialError={error} />;
   if (user.must_change_password) return <AuthScreen user={user} onAuthenticated={authenticated} />;
   return (
-    <Layout className="app-shell">
+    <Layout className="app-shell" inert={scanLocked}>
       {changingPassword && (
         <AuthScreen
           user={user}
@@ -511,6 +588,14 @@ function DigitalArchApp() {
             <span className="header-user-name">{user.display_name}</span>
           </span>
           <div className="header-account-actions">
+            {can('notifications:read') && !user.must_change_password && (
+              <StaffNotifications
+                key={user.id}
+                user={user}
+                onOpen={openNotification}
+                disabled={busy}
+              />
+            )}
             <IconButton
               className="header-account-button"
               type="text"
@@ -702,6 +787,7 @@ function DigitalArchApp() {
                     onPageAction={changePage}
                     sessions={active.sessions}
                     locked={locked}
+                    reviewLocks={active.operator_locks}
                     initialPageId={capturePageId}
                     onReplacement={(sessionId, candidateId, cancel) =>
                       run('replacement', async () => {
@@ -789,21 +875,41 @@ function DigitalArchApp() {
           </Suspense>
         </div>
       </Layout.Content>
-      <ApprovalNotifications user={user} onOpen={openConfirmation} />
       <footer className={`status-bar${ocrFooter ? ' status-bar-ocr' : ''}`}>
-        <span title={ocrFooter?.text}>
-          {view === 'document'
-            ? documentStatus?.batchId === documentBatchId
-              ? documentStatus.text
-              : 'Document review'
-            : view === 'ocr' && ocrJobId
-              ? ocrFooter?.text || 'OCR job'
-              : view === 'viewer'
-                ? 'Published document library · Viewer activity is recorded'
-                : active
-                  ? active.batch.batch_code
-                  : 'No active batch'}
-        </span>
+        {view === 'document' && documentStatus?.batchId === documentBatchId ? (
+          <div className="document-footer-status" role="status" aria-label={documentStatus.text}>
+            <Tag color="blue" icon={<FileTextOutlined aria-hidden />}>
+              {documentStatus.included} included pages
+            </Tag>
+            <Tag color="green" icon={<CheckCircleOutlined aria-hidden />}>
+              {documentStatus.reviewed} reviewed
+            </Tag>
+            <Tag
+              color={documentStatus.findings ? 'orange' : 'green'}
+              icon={<ExclamationCircleOutlined aria-hidden />}
+            >
+              {documentStatus.findings} unresolved findings
+            </Tag>
+            <Tag color="geekblue" icon={<HistoryOutlined aria-hidden />}>
+              {documentStatus.unsent ? 'Not sent to QC' : `Cycle ${documentStatus.cycle}`}
+            </Tag>
+            <Tag color="cyan" icon={<AuditOutlined aria-hidden />}>
+              Revision {documentStatus.revision}
+            </Tag>
+          </div>
+        ) : (
+          <span title={ocrFooter?.text}>
+            {view === 'document'
+              ? 'Document review'
+              : view === 'ocr' && ocrJobId
+                ? ocrFooter?.text || 'OCR job'
+                : view === 'viewer'
+                  ? 'Published document library · Viewer activity is recorded'
+                  : active
+                    ? active.batch.batch_code
+                    : 'No active batch'}
+          </span>
+        )}
         {ocrFooter && (
           <Progress
             className="ocr-footer-progress"
@@ -813,7 +919,11 @@ function DigitalArchApp() {
             status={ocrFooter.status === 'completed_with_errors' ? 'exception' : 'normal'}
           />
         )}
-        <span>Asia/Jakarta · WIB</span>
+        <span>
+          Copyright ©{' '}
+          {new Date().getFullYear() === 2025 ? '2025' : `2025–${new Date().getFullYear()}`} - PT.
+          Candi Argo Joyo
+        </span>
       </footer>
       <ScannerSettings
         open={settings && !locked}
@@ -826,56 +936,47 @@ function DigitalArchApp() {
         setPageDelay={setPageDelay}
         onAction={scannerAction}
       />
-      <Drawer title="Batch Info" open={info} onClose={() => setInfo(false)} size={360}>
-        <Space orientation="vertical">
-          <p>Physical location is optional and may be shared by multiple batches.</p>
-          <label htmlFor="physical-location">Physical location</label>
-          <Input
-            id="physical-location"
-            value={locationDraft}
-            maxLength={240}
-            placeholder="Rack A-12, Box 017…"
-            onChange={(event) => setLocationDraft(event.target.value)}
-          />
-          <Button
-            type="primary"
-            loading={working === 'location'}
-            onClick={() =>
-              run('location', async () => {
-                setActive(
-                  await api(
-                    `/api/batches/${active.batch.id}`,
-                    { version: active.batch.version, physicalLocation: locationDraft },
-                    'PATCH',
-                  ),
-                );
-                setInfo(false);
+      <BatchInfo
+        open={info}
+        onClose={() => setInfo(false)}
+        location={locationDraft}
+        onChange={setLocationDraft}
+        saving={working === 'location'}
+        error={error}
+        editable={!active?.operator_locks?.locationLocked}
+        onSave={() =>
+          run('location', async () => {
+            setActive(
+              await api(
+                `/api/batches/${active.batch.id}`,
+                { version: active.batch.version, physicalLocation: locationDraft },
+                'PATCH',
+              ),
+            );
+            setInfo(false);
+          })
+        }
+      >
+        {active?.pages.length === 0 && (
+          <Popconfirm
+            title="Cancel this empty batch?"
+            description="The batch remains in the audit trail. No files are deleted."
+            onConfirm={() =>
+              run('cancel', async () => {
+                await api(`/api/batches/${active.batch.id}/cancel`, {
+                  version: active.batch.version,
+                });
+                clearBatch();
+                showView('home');
               })
             }
           >
-            Save location
-          </Button>
-          {active?.pages.length === 0 && (
-            <Popconfirm
-              title="Cancel this empty batch?"
-              description="The batch remains in the audit trail. No files are deleted."
-              onConfirm={() =>
-                run('cancel', async () => {
-                  await api(`/api/batches/${active.batch.id}/cancel`, {
-                    version: active.batch.version,
-                  });
-                  clearBatch();
-                  showView('home');
-                })
-              }
-            >
-              <Button danger disabled={busy}>
-                Cancel empty batch
-              </Button>
-            </Popconfirm>
-          )}
-        </Space>
-      </Drawer>
+            <Button danger disabled={busy}>
+              Cancel empty batch
+            </Button>
+          </Popconfirm>
+        )}
+      </BatchInfo>
       <Modal
         title="Complete Capture?"
         open={complete}
@@ -911,6 +1012,59 @@ function DigitalArchApp() {
           >
             I have reviewed and accept the partial or interrupted sessions and their saved pages.
           </Checkbox>
+        )}
+      </Modal>
+      <Modal
+        title={
+          stoppingScan || cancellingScan
+            ? 'Stopping scan'
+            : finalizingScan
+              ? 'Saving captured pages'
+              : 'Scan in progress'
+        }
+        open={scanLocked}
+        centered
+        width={440}
+        zIndex={2000}
+        closable={false}
+        mask={{ closable: false }}
+        keyboard={false}
+        footer={
+          <Button
+            danger
+            onClick={cancelScan}
+            loading={cancellingScan || stoppingScan}
+            disabled={finalizingScan || capture?.jobStatus === 'unknown'}
+          >
+            {stoppingScan || cancellingScan ? 'Cancelling scan…' : 'Cancel scan'}
+          </Button>
+        }
+      >
+        <Space size={16} align="start">
+          <Spin size="large" />
+          <div>
+            <p role="status" aria-live="polite" aria-atomic="true">
+              {capture
+                ? `${capturedPages} ${capturedPages === 1 ? 'page' : 'pages'} captured`
+                : 'Preparing scanner…'}
+            </p>
+            <p>
+              {stoppingScan || cancellingScan
+                ? 'Waiting for capture to stop and saved pages to finish registering.'
+                : finalizingScan
+                  ? 'Registering the remaining pages before unlocking the workspace.'
+                  : capturedPages
+                    ? 'Scanning continues.'
+                    : 'Waiting for the first page.'}
+            </p>
+            <p>
+              Captured pages are retained if you cancel. Other actions are locked until capture
+              finishes.
+            </p>
+          </div>
+        </Space>
+        {(error || capture?.stopError) && (
+          <Alert type="error" showIcon title={error || capture.stopError} />
         )}
       </Modal>
     </Layout>

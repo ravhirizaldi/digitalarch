@@ -10,14 +10,16 @@ string? Option(string flag)
     var index = Array.IndexOf(args, flag);
     return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
 }
-string ProfileFile() => Option("--profile-file") ?? Environment.GetEnvironmentVariable("DIGITALARCH_NAPS2_PROFILES")
-    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NAPS2", "profiles.xml");
+ProfileResult ProfileCatalog() => Profiles.Discover(Option("--profile-file") ?? Environment.GetEnvironmentVariable("DIGITALARCH_NAPS2_PROFILES"),
+    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData));
 var inspect = args.Contains("--inspect");
 var devices = new List<ScanDevice>();
 ProfileResult? inventory = null;
+string? selectedProfileId = null;
 void EmitInspection(object probe) => Emit(new { success = true,
     devices = devices.Select(d => new { id = d.ID, d.Name, driver = "Wia" }),
-    profiles = inventory!.Profiles, warnings = inventory.Warnings, probe });
+    profiles = inventory!.Profiles, warnings = inventory.Warnings, profileFiles = inventory.Files,
+    incomplete = inventory.Incomplete, profileId = selectedProfileId, probe });
 
 try
 {
@@ -28,10 +30,12 @@ try
     }
     if (args.Contains("--profiles"))
     {
-        var catalog = Profiles.Read(ProfileFile());
-        Emit(new { success = true, catalog.Profiles, catalog.Warnings });
+        var catalog = ProfileCatalog();
+        Emit(new { success = true, catalog.Profiles, catalog.Warnings, profileFiles = catalog.Files, incomplete = catalog.Incomplete });
         return;
     }
+    inventory = ProfileCatalog();
+    selectedProfileId = Option("--profile") ?? Profiles.Select(inventory, [])?.Id;
     if (!OperatingSystem.IsWindows()) throw new CliFailure("helper_unavailable", "Windows dotnet is required for WIA.");
     using var context = new ScanningContext(new GdiImageContext());
     var controller = new ScanController(context);
@@ -42,16 +46,20 @@ try
         Emit(new { success = true, driver = "Wia", devices = devices.Select(d => new { id = d.ID, d.Name, driver = "Wia" }) });
         return;
     }
-    var profiles = Profiles.Read(ProfileFile());
-    inventory = profiles;
-    var profileId = Option("--profile") ?? Profiles.Default.Id;
-    var profile = profileId == Profiles.Default.Id ? Profiles.Default : profiles.Profiles.SingleOrDefault(p => p.Id == profileId)
-        ?? throw new CliFailure("invalid_profile", "Selected profile was not found.");
+    var profiles = inventory;
+    var profileId = Option("--profile");
+    var profile = profileId == null ? Profiles.Select(profiles, devices.Select(d => (d.ID, d.Name)))
+        : profileId == Profiles.Default.Id ? Profiles.Default : profiles.Profiles.SingleOrDefault(p => p.Id == profileId);
+    selectedProfileId = profile?.Id;
+    if (profile == null) throw new CliFailure(profileId == null ? "profile_required" : "invalid_profile",
+        profileId == null ? "Several profiles are available. Select a profile explicitly." : "Selected profile was not found. Select an available profile.");
+    if (Option("--profile-revision") is { } expectedRevision && expectedRevision != profile.Revision)
+        throw new CliFailure("profile_changed", "The scanner profile changed after selection. Refresh and review its settings before scanning.");
     if (!profile.Compatible) throw new CliFailure("unsupported_profile", "The native profile contains unsupported settings. Use a compatible profile.");
     var selectedId = Option("--device");
     var exact = devices.Where(d => profile.DeviceId != null && d.ID == profile.DeviceId).ToList();
-    var candidates = exact.Count > 0 ? exact : devices.Where(d => d.Name == profile.DeviceName).ToList();
-    if (selectedId != null) candidates = devices.Where(d => d.ID == selectedId && (d.ID == profile.DeviceId || d.Name == profile.DeviceName)).ToList();
+    var candidates = profile.Id == Profiles.Default.Id ? devices : exact.Count > 0 ? exact : devices.Where(d => d.Name == profile.DeviceName).ToList();
+    if (selectedId != null) candidates = devices.Where(d => d.ID == selectedId && (profile.Id == Profiles.Default.Id || d.ID == profile.DeviceId || (exact.Count == 0 && d.Name == profile.DeviceName))).ToList();
     if (candidates.Count == 0) throw new CliFailure("device_not_found", "The configured scanner is not currently available through Windows WIA.");
     if (candidates.Count > 1) throw new CliFailure("ambiguous_device", "Multiple matching devices were found. Select an explicit device.");
     var scanner = candidates.Single();

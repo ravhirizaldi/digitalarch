@@ -19,14 +19,14 @@ export const finalPublication = `d.workflow_status='approved' AND r.outcome='pas
   AND EXISTS(SELECT 1 FROM approval_decisions a WHERE a.qc_review_id=r.id AND a.level=1 AND a.decision='approved')
   AND (d.approval_l2_required=false OR EXISTS(SELECT 1 FROM approval_decisions a WHERE a.qc_review_id=r.id AND a.level=2 AND a.decision='approved'))`;
 
-export function approvals(pool, storage) {
-  function scope(user, position = 1) {
-    const staff = user.permissions.some((p) =>
-      ['qc:read', 'approval_l1:review', 'approval_l2:review'].includes(p),
-    );
-    return `(b.assigned_operator_id=$${position} OR ${user.permissions.includes('documents:read_all') ? 'true' : 'false'}
+export function approvalScope(user, position = 1) {
+  const staff = user.permissions.some((p) =>
+    ['qc:read', 'approval_l1:review', 'approval_l2:review'].includes(p),
+  );
+  return `(b.assigned_operator_id=$${position} OR ${user.permissions.includes('documents:read_all') ? 'true' : 'false'}
       OR (${staff ? 'true' : 'false'} AND ${submittedBatch}) OR (${finalPublication}))`;
-  }
+}
+export function approvals(pool, storage) {
   async function load(client, user, batchId, lock = false) {
     requirePermission(user, 'documents:read');
     uuid(batchId);
@@ -35,7 +35,7 @@ export function approvals(pool, storage) {
         `SELECT b.* FROM archive_batches b
       JOIN LATERAL (SELECT * FROM documents WHERE batch_id=b.id ORDER BY document_index LIMIT 1) d ON true
       LEFT JOIN qc_reviews r ON r.document_id=d.id AND r.cycle=d.review_cycle
-      WHERE b.id=$2 AND b.deleted_at IS NULL AND ${scope(user)} ${lock ? 'FOR UPDATE OF b' : ''}`,
+       WHERE b.id=$2 AND b.deleted_at IS NULL AND ${approvalScope(user)} ${lock ? 'FOR UPDATE OF b' : ''}`,
         [user.id, batchId],
       )
     ).rows[0];
@@ -283,7 +283,7 @@ export function approvals(pool, storage) {
         LEFT JOIN qc_reviews r ON r.document_id=d.id AND r.cycle=d.review_cycle
         LEFT JOIN users op ON op.id=b.assigned_operator_id LEFT JOIN users qc ON qc.id=coalesce(r.assigned_reviewer_id,r.decided_by,r.claimed_by)
         LEFT JOIN users l2 ON l2.id=d.assigned_l2_id`;
-      const access = `b.deleted_at IS NULL AND ${scope(user)}`;
+      const access = `b.deleted_at IS NULL AND ${approvalScope(user)}`;
       const where = `WHERE ${access}
         AND CASE $2 WHEN 'published' THEN (${finalPublication}) WHEN 'l1' THEN d.workflow_status='awaiting_approval_l1'
           WHEN 'l2' THEN d.workflow_status='awaiting_approval_l2' AND d.assigned_l2_id=$1 WHEN 'dropped' THEN d.workflow_status='dropped' ELSE true END
@@ -791,7 +791,9 @@ export function approvals(pool, storage) {
         r.cycle,d.review_cycle,d.workflow_status,(a.level=2 OR NOT d.approval_l2_required) AS final
         FROM approval_decisions a JOIN qc_reviews r ON r.id=a.qc_review_id JOIN documents d ON d.id=r.document_id
         JOIN archive_batches b ON b.id=d.batch_id WHERE b.assigned_operator_id=$1 AND b.deleted_at IS NULL AND a.decision='approved'
-        AND NOT EXISTS(SELECT 1 FROM approval_notification_reads n WHERE n.user_id=$1 AND n.decision_id=a.id)
+         AND NOT EXISTS(SELECT 1 FROM approval_notification_reads n WHERE n.user_id=$1 AND n.decision_id=a.id)
+         AND NOT EXISTS(SELECT 1 FROM staff_notification_recipients n JOIN staff_notification_events e ON e.id=n.event_id
+           WHERE n.user_id=$1 AND e.decision_id=a.id AND n.read_at IS NOT NULL)
         ORDER BY a.decided_at DESC,a.id LIMIT 20`,
           [user.id],
         )
@@ -804,10 +806,18 @@ export function approvals(pool, storage) {
       const { batch } = await load(pool, user, item.batch_id);
       if (batch.assigned_operator_id !== user.id)
         throw failure('forbidden', 'This notification belongs to the assigned operator.', 403);
-      await pool.query(
-        'INSERT INTO approval_notification_reads(user_id,decision_id) VALUES($1,$2) ON CONFLICT DO NOTHING',
-        [user.id, id],
-      );
+      await transaction(pool, async (client) => {
+        await client.query(
+          'INSERT INTO approval_notification_reads(user_id,decision_id) VALUES($1,$2) ON CONFLICT DO NOTHING',
+          [user.id, id],
+        );
+        await client.query(
+          `UPDATE staff_notification_recipients n SET read_at=now()
+          FROM staff_notification_events e WHERE n.event_id=e.id AND e.decision_id=$2
+          AND n.user_id=$1 AND n.read_at IS NULL`,
+          [user.id, id],
+        );
+      });
       return { saved: true };
     },
   };

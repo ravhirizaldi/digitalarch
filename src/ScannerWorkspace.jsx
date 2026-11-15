@@ -44,6 +44,7 @@ export default function ScannerWorkspace({
   locked = false,
   initialPageId = null,
   onReplacement,
+  reviewLocks,
 }) {
   const [selected, setSelected] = useState(initialPageId);
   const [placement, setPlacement] = useState('append');
@@ -78,8 +79,10 @@ export default function ScannerWorkspace({
     }
   }, [state.job?.id, state.job?.provider, initialPageId]);
   const scanning = state.status === 'scanning' || requesting === 'scan';
+  const membershipLocked = reviewLocks?.orderingLocked || reviewLocks?.completenessLocked;
   const scanDisabled =
     locked ||
+    membershipLocked ||
     !!pending ||
     busy ||
     !scanner.canScan ||
@@ -132,7 +135,7 @@ export default function ScannerWorkspace({
               <Button
                 size="small"
                 type="link"
-                disabled={busy}
+                disabled={busy || membershipLocked}
                 onClick={() => restorePage(undoPage)}
               >
                 Undo removal
@@ -208,27 +211,27 @@ export default function ScannerWorkspace({
                 <PageLabelEditor
                   key={page.id}
                   page={page}
-                  disabled={busy || !!pending}
+                  disabled={busy || !!pending || page.qcProtected}
                   error={pageError}
                   onSave={(label) => onPageAction(page, 'rename', label)}
                 />
                 <IconButton
                   label="Rotate left"
                   icon={<RotateLeftOutlined />}
-                  disabled={busy || page.excluded}
+                  disabled={busy || page.excluded || page.qcProtected}
                   onClick={() => onPageAction(page, 'rotate-left')}
                 />
                 <IconButton
                   label="Rotate right"
                   icon={<RotateRightOutlined />}
-                  disabled={busy || page.excluded}
+                  disabled={busy || page.excluded || page.qcProtected}
                   onClick={() => onPageAction(page, 'rotate-right')}
                 />
                 {page.excluded ? (
                   <IconButton
                     label="Restore page"
                     icon={<UndoOutlined />}
-                    disabled={busy}
+                    disabled={busy || membershipLocked}
                     onClick={() => restorePage(page)}
                   />
                 ) : (
@@ -236,14 +239,16 @@ export default function ScannerWorkspace({
                     label="Remove page"
                     icon={<DeleteOutlined />}
                     danger
-                    disabled={busy}
+                    disabled={busy || membershipLocked || page.qcProtected}
                     onClick={async () => {
                       if (await onPageAction(page, 'remove')) setLastRemoved(page.id);
                     }}
                   />
                 )}
                 <Button
-                  disabled={busy || !!pending || page.excluded}
+                  disabled={
+                    busy || !!pending || page.excluded || membershipLocked || page.qcProtected
+                  }
                   onClick={() => {
                     setSelected(page.id);
                     setReplacement(true);
@@ -360,7 +365,7 @@ export default function ScannerWorkspace({
           <Select
             aria-label="New page placement"
             value={placement}
-            disabled={busy || !!pending}
+            disabled={busy || !!pending || membershipLocked}
             onChange={setPlacement}
             options={[
               { value: 'append', label: 'Append to end' },
@@ -385,6 +390,13 @@ export default function ScannerWorkspace({
           ) : null}
           {!requestedMode && feedback && <Alert type="error" showIcon title={feedback} />}
         </div>
+      )}
+      {!locked && membershipLocked && (
+        <Alert
+          type="info"
+          showIcon
+          title="QC has reviewed ordering or completeness. QC must reopen it before adding, removing or replacing scans."
+        />
       )}
       {narrow ? (
         <div className="narrow-preview">{preview}</div>

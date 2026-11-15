@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { audit, keys, text } from './auth.mjs';
 import { failure } from './errors.mjs';
 import { mergeMetadata, metadataTypes, normalizeMetadataDate } from './metadata-extract.mjs';
+import { operatorFieldLocked, reworkLocks } from './workflow.mjs';
 
 export const documentMetadataTypes = [...metadataTypes, 'document_type', 'physical_location'];
 export const fieldsOf = (doc) => doc.metadata_json?.fields || [];
@@ -12,6 +13,18 @@ export const metadataOf = (doc) => ({
   updatedAt: doc.updated_at,
   status: doc.metadata_status,
 });
+
+export async function editableMetadata(client, doc) {
+  const locks = await reworkLocks(client, doc);
+  return {
+    ...metadataOf(doc),
+    operatorLocked: locks.metadataLocked,
+    fields: fieldsOf(doc).map((field) => ({
+      ...field,
+      operatorLocked: locks.lockedFieldIds.includes(field.id),
+    })),
+  };
+}
 
 export async function persistMetadata(
   client,
@@ -68,15 +81,23 @@ export async function persistMetadata(
   );
 }
 
-export function editedFields(doc, body, user, verifying) {
+export function editedFields(doc, body, user, verifying, lockedFieldIds = []) {
   keys(body, ['version', 'fields']);
   if (body.version !== doc.metadata_version || !Number.isSafeInteger(body.version))
     throw failure('conflict', 'Metadata changed. Reload before saving.', 409);
   if (!Array.isArray(body.fields) || body.fields.length > 200)
     throw failure('invalid_request', 'At most 200 metadata fields are allowed.');
   const seen = new Set();
-  return body.fields.map((field) => {
-    keys(field, ['id', 'type', 'value', 'context', 'verification', 'candidateId']);
+  const result = body.fields.map((field) => {
+    keys(field, [
+      'id',
+      'type',
+      'value',
+      'context',
+      'verification',
+      'candidateId',
+      'operatorLocked',
+    ]);
     if (!documentMetadataTypes.includes(field.type))
       throw failure('invalid_request', 'Unsupported field type.');
     const old = fieldsOf(doc).find((item) => item.id === field.id);
@@ -84,6 +105,30 @@ export function editedFields(doc, body, user, verifying) {
       throw failure('invalid_request', 'Unknown or duplicate field.');
     const id = old?.id || randomUUID();
     seen.add(id);
+    if (
+      field.operatorLocked !== undefined &&
+      (!verifying || typeof field.operatorLocked !== 'boolean')
+    )
+      throw failure(
+        'forbidden',
+        'Only the claiming QC officer can reopen or protect metadata.',
+        403,
+      );
+    if (!verifying && old && (operatorFieldLocked(old) || lockedFieldIds.includes(old.id))) {
+      if (
+        field.type !== old.type ||
+        field.value !== old.value ||
+        (field.context || '') !== (old.context || '') ||
+        (field.verification !== undefined && field.verification !== old.verification) ||
+        field.candidateId
+      )
+        throw failure(
+          'qc_locked',
+          'QC-corrected or verified fields cannot be changed by the operator.',
+          409,
+        );
+      return old;
+    }
     const value = text(field.value, 2000, 'Metadata value');
     const context = text(field.context, 240, 'Field context', true) || '';
     const normalized = field.type === 'date' ? normalizeMetadataDate(value) : null;
@@ -119,6 +164,14 @@ export function editedFields(doc, body, user, verifying) {
       throw failure('invalid_request', 'Candidate does not match this field.');
     return {
       ...old,
+      operatorLocked: verifying
+        ? field.operatorLocked === false && field.verification !== 'verified'
+          ? false
+          : field.operatorLocked === true ||
+            changed ||
+            field.verification === 'verified' ||
+            operatorFieldLocked(old || {})
+        : old?.operatorLocked || false,
       id,
       type: field.type,
       value,
@@ -140,21 +193,50 @@ export function editedFields(doc, body, user, verifying) {
       editedByName: changed ? user.display_name : old?.editedByName,
       editedAt: changed ? new Date().toISOString() : old?.editedAt,
       verifiedBy:
-        verifying && field.verification === 'verified' ? user.id : changed ? null : old?.verifiedBy,
+        verifying && field.verification === 'verified'
+          ? user.id
+          : changed || (verifying && field.verification === 'needs_review')
+            ? null
+            : old?.verifiedBy,
       verifiedByName:
         verifying && field.verification === 'verified'
           ? user.display_name
-          : changed
+          : changed || (verifying && field.verification === 'needs_review')
             ? null
             : old?.verifiedByName,
       verifiedAt:
         verifying && field.verification === 'verified'
           ? new Date().toISOString()
-          : changed
+          : changed || (verifying && field.verification === 'needs_review')
             ? null
             : old?.verifiedAt,
     };
   });
+  if (
+    !verifying &&
+    fieldsOf(doc).some(
+      (field) =>
+        (operatorFieldLocked(field) || lockedFieldIds.includes(field.id)) && !seen.has(field.id),
+    )
+  )
+    throw failure(
+      'qc_locked',
+      'QC-corrected or verified fields cannot be deleted by the operator.',
+      409,
+    );
+  if (
+    !verifying &&
+    ['title', 'document_number', 'document_type', 'physical_location'].some((type) => {
+      const first = fieldsOf(doc).find((field) => field.type === type);
+      return (
+        first &&
+        (operatorFieldLocked(first) || lockedFieldIds.includes(first.id)) &&
+        result.find((field) => field.type === type)?.id !== first.id
+      );
+    })
+  )
+    throw failure('qc_locked', 'Protected metadata cannot be overridden by another field.', 409);
+  return result;
 }
 
 export async function currentOcr(client, batchId, { pageId = null, includeText = true } = {}) {
@@ -162,7 +244,7 @@ export async function currentOcr(client, batchId, { pageId = null, includeText =
     await client.query(
       `SELECT p.id AS page_id,p.page_number,
     p.page_number-1 AS page_offset,
-    r.id AS result_id,r.status,r.is_stale,r.image_revision,r.processed_at,r.engine,r.engine_version,
+    r.id AS result_id,coalesce(r.reused_result_id,r.id) AS source_result_id,r.status,r.is_stale,r.image_revision,r.processed_at,r.engine,r.engine_version,
     r.error_message,j.processing_config,
     ${includeText ? 'coalesce(r.extracted_text,c.extracted_text)' : 'NULL'} AS extracted_text,
     ${includeText ? 'coalesce(r.structured_result,c.structured_result)' : 'NULL'} AS structured_result,
@@ -184,6 +266,8 @@ export async function currentOcr(client, batchId, { pageId = null, includeText =
 }
 
 export async function extractDocument(client, doc, user = null) {
+  const locks = await reworkLocks(client, doc);
+  if (locks.metadataLocked) return;
   const summaries = await currentOcr(client, doc.batch_id, { includeText: false });
   const extractionKey = JSON.stringify(
     summaries.map((p) => [p.page_id, p.page_number, p.result_id, p.status, p.corrected_at]),
@@ -199,9 +283,12 @@ export async function extractDocument(client, doc, user = null) {
   const fields = previous.map((old) => {
     const candidates = extracted.fields.filter((f) => f.type === old.type);
     const sourceStale =
-      old.source?.some((s) => !ready.some((p) => p.result_id === s.resultId)) || false;
+      old.source?.some(
+        (s) => !ready.some((p) => p.result_id === s.resultId || p.source_result_id === s.resultId),
+      ) || false;
     return {
       ...old,
+      operatorLocked: locks.lockedFieldIds.includes(old.id),
       candidates,
       sourceStale,
       verification: sourceStale && !old.sourceStale ? 'needs_review' : old.verification,

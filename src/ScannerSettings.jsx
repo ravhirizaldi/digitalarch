@@ -125,7 +125,7 @@ export default function ScannerSettings({
               type="info"
               showIcon
               title="Detection is not physical readiness"
-              description="Device discovery does not prove paper availability, a connection, or mechanical readiness. Refresh after reconnecting or clearing a jam."
+              description="Profiles and devices refresh automatically about every 30 seconds while Real Hardware is open, and are checked again before scanning. Discovery does not prove paper or mechanical readiness. Use Refresh after clearing a jam."
             />
             <Collapse
               size="small"
@@ -135,6 +135,11 @@ export default function ScannerSettings({
                   label: 'Native NAPS2 profile notes',
                   children: (
                     <Space orientation="vertical" className="fill-width">
+                      {scanner.profileFiles?.map((file) => (
+                        <p key={file} className="break-word">
+                          Profile file: {file}
+                        </p>
+                      ))}
                       {scanner.profileWarnings?.map((warning, i) => (
                         <Alert key={i} type="warning" title={warning} />
                       ))}
@@ -143,6 +148,7 @@ export default function ScannerSettings({
                         .map((item) => (
                           <section key={item.id} className="profile-note">
                             <strong>{item.name}</strong>{' '}
+                            {item.isDefault && <Tag>Native default</Tag>}
                             <Tag color={item.compatible ? 'success' : 'warning'}>
                               {item.compatible ? 'Supported' : 'Unsupported'}
                             </Tag>
@@ -167,6 +173,21 @@ export default function ScannerSettings({
                         <span className="muted">No native desktop profiles available</span>
                       )}
                     </Space>
+                  ),
+                },
+                {
+                  key: 'changes',
+                  label: `Last detected changes · ${dateTime(scanner.inventoryChangedAt)}`,
+                  children: scanner.inventoryChanges?.length ? (
+                    <ul>
+                      {scanner.inventoryChanges.map((change, index) => (
+                        <li key={index} className="break-word">
+                          {change}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <span className="muted">No inventory changes detected yet.</span>
                   ),
                 },
               ]}

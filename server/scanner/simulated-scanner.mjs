@@ -55,7 +55,8 @@ export function simulatedScanner({
         if (!['scenario', 'pageDelay'].includes(key))
           throw failure('invalid_options', 'Unsupported simulation option.');
     },
-    async scan(job, options) {
+    async scan(job, options, signal) {
+      signal?.throwIfAborted();
       const scenario = scenarios.find((s) => s.id === options.scenario);
       if (scenario.empty)
         throw failure(
@@ -87,7 +88,8 @@ export function simulatedScanner({
       await mkdir(scans, { recursive: true });
       job.totalPages = scenario.failAfter || files.length;
       for (let i = 0; i < files.length; i++) {
-        await delay(options.pageDelay);
+        await delay(options.pageDelay, undefined, { signal });
+        signal?.throwIfAborted();
         const source = await openSafe(directory, files[i]);
         const target = path.join(scans, `${job.id}-${String(i + 1).padStart(3, '0')}.png`);
         const temporary = target + '.partial';

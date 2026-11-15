@@ -8,6 +8,7 @@ import { ocrDefaults } from './ocr-defaults.mjs';
 import { processingConfig } from './ocr-profiles.mjs';
 import { documentMetadata } from './document-metadata.mjs';
 import { documentFor, submittedBatch, requireSubmission } from './workflow.mjs';
+import { queueCaptureOcr } from './capture-ocr.mjs';
 
 const jobSelect = `SELECT j.*,b.batch_code,b.physical_location,b.assigned_operator_id,
    (SELECT workflow_status FROM documents WHERE batch_id=b.id ORDER BY document_index LIMIT 1) AS workflow_status,
@@ -543,9 +544,7 @@ export function ocrProcessing(pool, storage, options = {}) {
             'OCR is controlled by the QC workspace during or after review.',
             409,
           );
-        const queued = (
-          await client.query('SELECT queue_batch_ocr($1,$2,$3) AS id', [batchId, null, config])
-        ).rows[0].id;
+        const queued = await queueCaptureOcr(client, storage, doc, null, config);
         if (!queued)
           throw failure('empty_batch', 'OCR requires at least one retained captured page.', 409);
         await audit(client, user, 'ocr.requested', 'ocr_job', queued, {}, batchId);
@@ -598,6 +597,12 @@ export function ocrProcessing(pool, storage, options = {}) {
         : null;
       const next = await transaction(pool, async (client) => {
         const job = await authorize(user, id, true, client, true);
+        if (job.workflow_status === 'rework')
+          throw failure(
+            'qc_locked',
+            'Returned work reuses reviewed OCR. Complete capture to recognize only new or changed images.',
+            409,
+          );
         if (job.version !== body.version)
           throw failure('conflict', 'OCR job changed. Refresh before continuing.', 409);
         if (!terminal.includes(job.status))
@@ -696,11 +701,50 @@ export function ocrProcessing(pool, storage, options = {}) {
             "UPDATE page_ocr_results SET status='cancelled',updated_at=now() WHERE ocr_job_id=$1 AND status='queued'",
             [id],
           );
-        if (action === 'retry-failed')
+        if (action === 'retry-failed') {
+          let retryIds = null;
+          if (job.workflow_status === 'rework') {
+            const review = (
+              await client.query(
+                `SELECT r.snapshot FROM qc_reviews r JOIN documents d ON d.id=r.document_id
+               WHERE d.batch_id=$1 AND r.cycle=d.review_cycle AND r.outcome='returned'`,
+                [job.batch_id],
+              )
+            ).rows[0];
+            if (!Array.isArray(review?.snapshot?.pages))
+              throw failure(
+                'qc_locked',
+                'The returned snapshot cannot prove which images need retrying.',
+                409,
+              );
+            const retained = new Set(
+              review.snapshot.pages.map((page) => `${page.id}:${page.image_revision}`),
+            );
+            const failed = (
+              await client.query(
+                "SELECT id,page_id,image_revision,reused_result_id FROM page_ocr_results WHERE ocr_job_id=$1 AND status IN ('failed','processing')",
+                [id],
+              )
+            ).rows;
+            retryIds = failed
+              .filter(
+                (page) =>
+                  !page.reused_result_id && !retained.has(`${page.page_id}:${page.image_revision}`),
+              )
+              .map((page) => page.id);
+            if (!retryIds.length)
+              throw failure(
+                'qc_locked',
+                'Only new or changed rework images can be retried. Existing OCR exceptions stay with QC.',
+                409,
+              );
+          }
           await client.query(
-            `UPDATE page_ocr_results SET status='queued',attempt_count=0,processed_at=NULL,error_code=NULL,error_message=NULL,next_attempt_at=now(),updated_at=now() WHERE ocr_job_id=$1 AND status IN ('failed','processing')`,
-            [id],
+            `UPDATE page_ocr_results SET status='queued',attempt_count=0,processed_at=NULL,error_code=NULL,error_message=NULL,next_attempt_at=now(),updated_at=now()
+             WHERE ocr_job_id=$1 AND status IN ('failed','processing') AND ($2::uuid[] IS NULL OR id=ANY($2::uuid[]))`,
+            [id, retryIds],
           );
+        }
         const status = {
           pause: 'paused',
           resume: 'queued',

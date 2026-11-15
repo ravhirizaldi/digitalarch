@@ -1,0 +1,59 @@
+.staff-notifications .ant-drawer-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 12px;
+  padding: 12px;
+  overflow: hidden;
+}
+.staff-inbox-toolbar,
+.staff-inbox-footer,
+.staff-inbox-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.staff-inbox-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-color: #a4b2c3 #f3f5f8;
+}
+.staff-inbox-item {
+  padding: 12px;
+  border-bottom: 1px solid #d8dee7;
+  overflow-wrap: anywhere;
+}
+.staff-inbox-unread {
+  background: #edf3fa;
+}
+.staff-inbox-heading .ant-btn {
+  padding: 0;
+  height: auto;
+  text-align: left;
+  white-space: normal;
+  font-weight: 600;
+}
+.staff-inbox-title {
+  margin-top: 4px;
+  font-weight: 600;
+}
+.staff-inbox-context,
+.staff-inbox-connection,
+.staff-inbox-footer {
+  color: #566376;
+  font-size: 12px;
+}
+.staff-inbox-stage {
+  margin-block: 4px 8px;
+}
+.staff-inbox-detail {
+  padding-block: 4px 12px;
+  white-space: pre-wrap;
+}
+.staff-inbox-footer {
+  padding-top: 8px;
+  border-top: 1px solid #d8dee7;
+}

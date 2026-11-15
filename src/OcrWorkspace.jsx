@@ -495,7 +495,9 @@ function OcrJobDetail({
             )}
             {['failed', 'completed_with_errors'].includes(job.status) && (
               <Button disabled={working} onClick={() => control('retry-failed')}>
-                Retry failed pages
+                {job.workflow_status === 'rework'
+                  ? 'Retry new/changed pages'
+                  : 'Retry failed pages'}
               </Button>
             )}
             {['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(job.status) && (
@@ -510,8 +512,18 @@ function OcrJobDetail({
                   description="The current global settings will be saved to a new run. This result and original PNGs are preserved."
                   okText="Reprocess"
                   onConfirm={() => control('reprocess')}
+                  disabled={job.workflow_status === 'rework'}
                 >
-                  <Button disabled={working || !nextConfig}>Reprocess</Button>
+                  <Button
+                    disabled={working || !nextConfig || job.workflow_status === 'rework'}
+                    title={
+                      job.workflow_status === 'rework'
+                        ? 'Complete rework capture to recognize only new or changed images.'
+                        : undefined
+                    }
+                  >
+                    Reprocess
+                  </Button>
                 </Popconfirm>
               </>
             )}

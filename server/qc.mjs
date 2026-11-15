@@ -12,6 +12,9 @@ import {
   setPageLabel,
   requireSubmission,
   qcOfficer,
+  unchangedReworkCapture,
+  reworkLocks,
+  operatorAction,
 } from './workflow.mjs';
 import {
   currentOcr,
@@ -21,6 +24,7 @@ import {
   metadataOf,
   persistMetadata,
   documentMetadataTypes,
+  editableMetadata,
 } from './qc-metadata.mjs';
 
 export const findingCategories = [
@@ -218,7 +222,7 @@ export function qualityControl(pool, storage) {
         ).rows;
         const sessions = (
           await client.query(
-            `SELECT id,session_number,status,page_count,replacement_target,replacement_status
+            `SELECT id,session_number,status,page_count,replacement_target,replacement_status,recovery_pending
           FROM scan_sessions WHERE batch_id=$1 ORDER BY session_number`,
             [batchId],
           )
@@ -239,6 +243,8 @@ export function qualityControl(pool, storage) {
           findings,
           sessions,
           history,
+          can_resubmit_without_capture: unchangedReworkCapture(doc, reviews[0], pages, sessions),
+          operator_locks: await reworkLocks(client, doc),
         };
       });
     },
@@ -308,6 +314,12 @@ export function qualityControl(pool, storage) {
           await qcOfficer(client, batch, user.id);
           await activeReview(client, doc, user);
         }
+        const previous = (
+          await client.query(
+            'SELECT coalesce(claimed_by,assigned_reviewer_id) AS reviewer FROM qc_reviews WHERE document_id=$1 AND cycle=$2',
+            [doc.id, doc.review_cycle],
+          )
+        ).rows[0];
         await client.query(
           'UPDATE qc_reviews SET claimed_by=NULL,claim_expires_at=NULL,assigned_reviewer_id=CASE WHEN $3 THEN $4 ELSE assigned_reviewer_id END,updated_at=now() WHERE document_id=$1 AND cycle=$2',
           [doc.id, doc.review_cycle, administrative, body.reviewerId || null],
@@ -326,7 +338,12 @@ export function qualityControl(pool, storage) {
           administrative ? 'qc.reassigned' : 'qc.released',
           'document',
           doc.id,
-          { cycle: doc.review_cycle, reason: body.reason, reviewerId: body.reviewerId || null },
+          {
+            cycle: doc.review_cycle,
+            reason: body.reason,
+            reviewerId: body.reviewerId || null,
+            previousReviewerId: previous?.reviewer || null,
+          },
           batchId,
         );
         return { released: true };
@@ -339,7 +356,7 @@ export function qualityControl(pool, storage) {
     async metadata(user, batchId, body, extract = false) {
       if (body === undefined) {
         const { doc } = await load(pool, user, batchId);
-        return { metadata: metadataOf(doc) };
+        return { metadata: await editableMetadata(pool, doc) };
       }
       await transaction(pool, async (client) => {
         const { batch, doc } = await load(client, user, batchId, true);
@@ -348,8 +365,15 @@ export function qualityControl(pool, storage) {
           await qcOfficer(client, batch, user.id);
           await activeReview(client, doc, user);
         } else await operatorEdit(client, user, batch);
+        const locks = qc ? null : await operatorAction(client, doc, 'metadata');
         if (extract) {
           keys(body, ['version']);
+          if (qc && (await reworkLocks(client, doc)).metadataLocked)
+            throw failure(
+              'qc_locked',
+              'Uncheck Metadata reviewed and save the draft before refreshing metadata.',
+              409,
+            );
           if (body.version !== doc.metadata_version)
             throw failure('conflict', 'Metadata changed. Reload first.', 409);
           if (
@@ -364,7 +388,7 @@ export function qualityControl(pool, storage) {
             );
           await extractDocument(client, doc, user);
         } else {
-          const fields = editedFields(doc, body, user, qc);
+          const fields = editedFields(doc, body, user, qc, locks?.lockedFieldIds);
           await persistMetadata(
             client,
             doc,
@@ -876,6 +900,9 @@ export function qualityControl(pool, storage) {
           revision: doc.revision,
           metadata: metadataOf(doc),
           pages: pages.map(publicPage),
+          captureSessions: (
+            await client.query('SELECT id FROM scan_sessions WHERE batch_id=$1', [batchId])
+          ).rows.map((session) => session.id),
           findings: (
             await client.query(
               'SELECT * FROM qc_findings WHERE document_id=$1 ORDER BY created_at',

@@ -1,6 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Alert, Button, Empty, Input, Popconfirm, Select, Space, Spin, Tag } from 'antd';
-import { DeleteOutlined, PlusOutlined, ReloadOutlined, WarningOutlined } from '@ant-design/icons';
+import {
+  DeleteOutlined,
+  LockOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  WarningOutlined,
+} from '@ant-design/icons';
 import { api } from './api';
 import { dateTime, IconButton } from './ui';
 import { useUrlState } from './useUrlState';
@@ -33,7 +39,7 @@ const types = metadataTypeLabels;
 
 export default function MetadataPanel({
   job,
-  canManage,
+  canManage: allowedManage,
   onSource,
   onDirtyChange,
   metadataPath,
@@ -52,6 +58,7 @@ export default function MetadataPanel({
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState('');
   const [error, setError] = useState('');
+  const canManage = allowedManage && (canVerify || !data?.operatorLocked);
   const [{ notices }, setNoticeState] = useUrlState(readNoticeState);
   const accept = useCallback((metadata) => {
     setData(metadata);
@@ -127,15 +134,20 @@ export default function MetadataPanel({
         ? { version: data.version }
         : {
             version: data.version,
-            fields: fields.map(({ id, type, value, context, verification, candidateId }) => ({
-              id,
-              type,
-              value,
-              context,
-              ...(metadataPath
-                ? { verification: verification || 'needs_review', candidateId }
-                : {}),
-            })),
+            fields: fields.map(
+              ({ id, type, value, context, verification, candidateId, operatorLockOverride }) => ({
+                id,
+                type,
+                value,
+                context,
+                ...(canVerify && operatorLockOverride !== undefined
+                  ? { operatorLocked: operatorLockOverride }
+                  : {}),
+                ...(metadataPath
+                  ? { verification: verification || 'needs_review', candidateId }
+                  : {}),
+              }),
+            ),
           };
       accept(
         (await api(`${base}${extract ? '/extract' : ''}`, body, extract ? 'POST' : 'PATCH'))
@@ -164,7 +176,14 @@ export default function MetadataPanel({
   );
   const extractButton = (
     <Button
-      disabled={!data || loading || !!working || !finished || (!!metadataPath && dirty)}
+      disabled={
+        !data ||
+        data.operatorLocked ||
+        loading ||
+        !!working ||
+        !finished ||
+        (!!metadataPath && dirty)
+      }
       loading={working === 'extract'}
       onClick={data?.version || dirty ? undefined : () => action(true)}
     >
@@ -219,6 +238,11 @@ export default function MetadataPanel({
         </Space>
       </div>
       {error && <Alert type="error" showIcon title={error} />}
+      {!canVerify && data?.operatorLocked && (
+        <p className="metadata-save-state">
+          <LockOutlined aria-hidden /> Metadata reviewed by QC · Operator editing locked
+        </p>
+      )}
       <div className="metadata-scroll">
         {loading ? (
           <Spin />
@@ -266,170 +290,192 @@ export default function MetadataPanel({
                 description="No metadata yet. Extract all pages or add a field."
               />
             )}
-            {fields.map((field, index) => (
-              <div
-                className="metadata-field"
-                id={`metadata-${field.id}`}
-                key={field.id || `new-${index}`}
-              >
-                <div className="metadata-field-heading">
-                  <Select
-                    showSearch
-                    optionFilterProp="label"
-                    aria-label={`Field ${index + 1} type`}
-                    value={field.type}
-                    disabled={!canManage || !!working}
-                    onChange={(type) => edit(index, { type })}
-                    options={Object.entries(types)
-                      .filter(
-                        ([value]) =>
-                          metadataPath || !['document_type', 'physical_location'].includes(value),
-                      )
-                      .map(([value, label]) => ({ value, label }))}
+            {fields.map((field, index) => {
+              const fieldEditable = canManage && (canVerify || !field.operatorLocked);
+              return (
+                <div
+                  className="metadata-field"
+                  id={`metadata-${field.id}`}
+                  key={field.id || `new-${index}`}
+                >
+                  <div className="metadata-field-heading">
+                    <Select
+                      showSearch
+                      optionFilterProp="label"
+                      aria-label={`Field ${index + 1} type`}
+                      value={field.type}
+                      disabled={!fieldEditable || !!working}
+                      onChange={(type) => edit(index, { type })}
+                      options={Object.entries(types)
+                        .filter(
+                          ([value]) =>
+                            metadataPath || !['document_type', 'physical_location'].includes(value),
+                        )
+                        .map(([value, label]) => ({ value, label }))}
+                    />
+                    {!!field.pageCount && (
+                      <Tag>
+                        {field.pageCount} {field.pageCount === 1 ? 'page' : 'pages'} ·{' '}
+                        {field.occurrences} occurrences
+                      </Tag>
+                    )}
+                    {metadataPath && (
+                      <Tag color={field.verification === 'verified' ? 'success' : 'default'}>
+                        {field.verification === 'verified' ? 'Verified' : 'Needs review'}
+                      </Tag>
+                    )}
+                    {canVerify && (
+                      <Button
+                        disabled={!!working}
+                        onClick={() => edit(index, { verification: 'verified' })}
+                      >
+                        Verify
+                      </Button>
+                    )}
+                    {field.operatorLocked && (
+                      <Tag icon={<LockOutlined aria-hidden />}>QC protected</Tag>
+                    )}
+                    {canVerify && field.operatorLocked && (
+                      <Button
+                        disabled={!!working}
+                        onClick={() =>
+                          edit(index, {
+                            verification: 'needs_review',
+                            operatorLocked: false,
+                            operatorLockOverride: false,
+                          })
+                        }
+                      >
+                        Reopen for operator
+                      </Button>
+                    )}
+                    {canManage && (
+                      <IconButton
+                        label={`Remove field ${index + 1}`}
+                        icon={<DeleteOutlined />}
+                        disabled={!fieldEditable || !!working}
+                        onClick={() => {
+                          setFields((current) => current.filter((_, i) => i !== index));
+                          setDirty(true);
+                        }}
+                      />
+                    )}
+                  </div>
+                  <Input.TextArea
+                    aria-label={`Field ${index + 1} value`}
+                    value={field.value}
+                    maxLength={2000}
+                    autoSize={{ minRows: 1, maxRows: 6 }}
+                    readOnly={!canManage}
+                    disabled={!fieldEditable || !!working}
+                    onChange={(event) => edit(index, { value: event.target.value })}
                   />
-                  {!!field.pageCount && (
-                    <Tag>
-                      {field.pageCount} {field.pageCount === 1 ? 'page' : 'pages'} ·{' '}
-                      {field.occurrences} occurrences
-                    </Tag>
-                  )}
+                  <Input
+                    aria-label={`Field ${index + 1} context`}
+                    value={field.context}
+                    placeholder="Role, party, date type or other context"
+                    maxLength={240}
+                    readOnly={!canManage}
+                    disabled={!fieldEditable || !!working}
+                    onChange={(event) => edit(index, { context: event.target.value })}
+                  />
                   {metadataPath && (
-                    <Tag color={field.verification === 'verified' ? 'success' : 'default'}>
-                      {field.verification === 'verified' ? 'Verified' : 'Needs review'}
-                    </Tag>
+                    <span className="metadata-provenance">
+                      {field.origin === 'manual'
+                        ? 'Manual entry'
+                        : field.origin === 'corrected'
+                          ? 'Human correction'
+                          : 'Machine suggestion'}
+                      {field.editedAt
+                        ? ` · Edited by ${field.editedByName || 'operator'} · ${dateTime(field.editedAt)}`
+                        : ''}
+                      {field.verifiedAt
+                        ? ` · Verified by ${field.verifiedByName || 'QC'} · ${dateTime(field.verifiedAt)}`
+                        : ''}
+                    </span>
                   )}
-                  {canVerify && (
-                    <Button
-                      disabled={!!working}
-                      onClick={() => edit(index, { verification: 'verified' })}
-                    >
-                      Verify
-                    </Button>
-                  )}
-                  {canManage && (
-                    <IconButton
-                      label={`Remove field ${index + 1}`}
-                      icon={<DeleteOutlined />}
-                      disabled={!!working}
-                      onClick={() => {
-                        setFields((current) => current.filter((_, i) => i !== index));
-                        setDirty(true);
-                      }}
+                  {field.sourceStale && (
+                    <Alert
+                      type="warning"
+                      title="Source OCR/image changed or a page was excluded. Verify this value against the current document."
                     />
                   )}
-                </div>
-                <Input.TextArea
-                  aria-label={`Field ${index + 1} value`}
-                  value={field.value}
-                  maxLength={2000}
-                  autoSize={{ minRows: 1, maxRows: 6 }}
-                  readOnly={!canManage}
-                  disabled={!!working}
-                  onChange={(event) => edit(index, { value: event.target.value })}
-                />
-                <Input
-                  aria-label={`Field ${index + 1} context`}
-                  value={field.context}
-                  placeholder="Role, party, date type or other context"
-                  maxLength={240}
-                  readOnly={!canManage}
-                  disabled={!!working}
-                  onChange={(event) => edit(index, { context: event.target.value })}
-                />
-                {metadataPath && (
-                  <span className="metadata-provenance">
-                    {field.origin === 'manual'
-                      ? 'Manual entry'
-                      : field.origin === 'corrected'
-                        ? 'Human correction'
-                        : 'Machine suggestion'}
-                    {field.editedAt
-                      ? ` · Edited by ${field.editedByName || 'operator'} · ${dateTime(field.editedAt)}`
-                      : ''}
-                    {field.verifiedAt
-                      ? ` · Verified by ${field.verifiedByName || 'QC'} · ${dateTime(field.verifiedAt)}`
-                      : ''}
-                  </span>
-                )}
-                {field.sourceStale && (
-                  <Alert
-                    type="warning"
-                    title="Source OCR/image changed or a page was excluded. Verify this value against the current document."
-                  />
-                )}
-                {!!field.candidates?.length && (
-                  <div className="metadata-candidates">
-                    <span className="qc-field-label">Suggested values</span>
-                    <Space wrap size={[4, 4]}>
-                      {field.candidates.map((candidate, i) => (
+                  {!!field.candidates?.length && (
+                    <div className="metadata-candidates">
+                      <span className="qc-field-label">Suggested values</span>
+                      <Space wrap size={[4, 4]}>
+                        {field.candidates.map((candidate, i) => (
+                          <Button
+                            key={`${candidate.id}-${i}`}
+                            disabled={!fieldEditable || !!working}
+                            onClick={() =>
+                              edit(index, {
+                                value: candidate.value,
+                                candidateId: candidate.id,
+                                verification: 'needs_review',
+                              })
+                            }
+                          >
+                            {candidate.value}
+                          </Button>
+                        ))}
+                      </Space>
+                    </div>
+                  )}
+                  {field.normalized && field.type === 'date' && !dirty && (
+                    <span className="muted">Normalized date: {field.normalized}</span>
+                  )}
+                  {field.alternatives?.length > 1 && (
+                    <div className="metadata-alternatives">
+                      <span className="muted">Possible spellings · verify before choosing</span>
+                      {field.alternatives.map((alt) => (
                         <Button
-                          key={`${candidate.id}-${i}`}
-                          disabled={!canManage}
-                          onClick={() =>
-                            edit(index, {
-                              value: candidate.value,
-                              candidateId: candidate.id,
-                              verification: 'needs_review',
-                            })
-                          }
+                          key={alt.value}
+                          size="small"
+                          disabled={!fieldEditable || !!working}
+                          onClick={() => edit(index, { value: alt.value })}
                         >
-                          {candidate.value}
+                          {alt.value} · {alt.pages.length} pages / {alt.count} occurrences
                         </Button>
                       ))}
-                    </Space>
-                  </div>
-                )}
-                {field.normalized && field.type === 'date' && !dirty && (
-                  <span className="muted">Normalized date: {field.normalized}</span>
-                )}
-                {field.alternatives?.length > 1 && (
-                  <div className="metadata-alternatives">
-                    <span className="muted">Possible spellings · verify before choosing</span>
-                    {field.alternatives.map((alt) => (
-                      <Button
-                        key={alt.value}
-                        size="small"
-                        disabled={!canManage || !!working}
-                        onClick={() => edit(index, { value: alt.value })}
-                      >
-                        {alt.value} · {alt.pages.length} pages / {alt.count} occurrences
-                      </Button>
-                    ))}
-                  </div>
-                )}
-                {!!field.source?.length && (
-                  <details
-                    className="metadata-evidence"
-                    open={
-                      expandedEvidence && field.id ? expandedEvidence.includes(field.id) : undefined
-                    }
-                    onToggle={(event) => {
-                      if (
-                        field.id &&
-                        expandedEvidence &&
-                        event.currentTarget.open !== expandedEvidence.includes(field.id)
-                      )
-                        onEvidenceToggle?.(field.id, event.currentTarget.open);
-                    }}
-                  >
-                    <summary>
-                      Source evidence
-                      {field.originalValue && field.originalValue !== field.value
-                        ? ' · value edited'
-                        : ''}
-                    </summary>
-                    {field.source.map((source, i) => (
-                      <div key={`${source.resultId}-${source.index}-${i}`}>
-                        <Button type="link" size="small" onClick={() => onSource(source)}>
-                          {pageNames[source.pageId] ?? `Page ${source.pageNumber}`}
-                        </Button>
-                        <span>{source.text}</span>
-                      </div>
-                    ))}
-                  </details>
-                )}
-              </div>
-            ))}
+                    </div>
+                  )}
+                  {!!field.source?.length && (
+                    <details
+                      className="metadata-evidence"
+                      open={
+                        expandedEvidence && field.id
+                          ? expandedEvidence.includes(field.id)
+                          : undefined
+                      }
+                      onToggle={(event) => {
+                        if (
+                          field.id &&
+                          expandedEvidence &&
+                          event.currentTarget.open !== expandedEvidence.includes(field.id)
+                        )
+                          onEvidenceToggle?.(field.id, event.currentTarget.open);
+                      }}
+                    >
+                      <summary>
+                        Source evidence
+                        {field.originalValue && field.originalValue !== field.value
+                          ? ' · value edited'
+                          : ''}
+                      </summary>
+                      {field.source.map((source, i) => (
+                        <div key={`${source.resultId}-${source.index}-${i}`}>
+                          <Button type="link" size="small" onClick={() => onSource(source)}>
+                            {pageNames[source.pageId] ?? `Page ${source.pageNumber}`}
+                          </Button>
+                          <span>{source.text}</span>
+                        </div>
+                      ))}
+                    </details>
+                  )}
+                </div>
+              );
+            })}
             {canManage && (
               <Button
                 className="metadata-add-field"

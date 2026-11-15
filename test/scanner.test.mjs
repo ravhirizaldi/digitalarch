@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createService } from '../server.mjs';
 import { realScanner, fallbackProfile, matchDevice } from '../server/scanner/real-scanner.mjs';
 import { failure } from '../server/errors.mjs';
+import { scannerService } from '../server/scanner/scanner-service.mjs';
 
 async function setup(t, options = {}) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'digitalarch-modes-'));
@@ -75,6 +76,58 @@ test('simulator initializes and scans without ever preparing a Windows helper', 
   assert.equal(job.profileId, 'simulator');
   assert.ok(job.completedAt >= job.startedAt);
   assert.equal(calls, 0);
+});
+
+test('cancel is exact-job scoped and keeps acquisition locked until the provider stops', async () => {
+  let finish;
+  let signal;
+  const service = scannerService({
+    providers: {
+      simulator: {
+        inspect: async () => ({ state: 'simulator_ready', canScan: true }),
+        scan: async (_job, _options, captureSignal) => {
+          signal = captureSignal;
+          await new Promise((resolve) => {
+            finish = resolve;
+          });
+          signal.throwIfAborted();
+        },
+      },
+    },
+  });
+  await service.initialize();
+  const job = await service.start();
+  assert.throws(() => service.cancel('scan-999-unrelated'), { code: 'capture_unavailable' });
+  assert.equal(signal.aborted, false);
+  assert.equal(service.cancel(job.id), true);
+  assert.equal(service.captureStatus(job.id).cancelRequested, true);
+  assert.equal(service.cancel(job.id), false, 'Repeated cancellation is idempotent');
+  assert.equal(signal.aborted, true);
+  assert.equal(service.status().busy, true, 'Requesting cancellation is not proof of termination');
+  await assert.rejects(service.start(), { code: 'busy' });
+  finish();
+  await until(() => !service.status().busy);
+  assert.equal(service.captureStatus(job.id).jobStatus, 'cancelled');
+  assert.equal(service.cancel(job.id), false, 'A finished job cannot cancel a newer session');
+});
+
+test('an unconfirmed Windows stop keeps the capture lock and reconciliation alive', async () => {
+  const service = scannerService({
+    providers: {
+      simulator: {
+        inspect: async () => ({ canScan: true }),
+        scan: async () => {
+          throw failure('capture_stop_unconfirmed', 'Verify the Windows helper before recovery.');
+        },
+      },
+    },
+  });
+  await service.initialize();
+  const job = await service.start();
+  await until(() => service.captureStatus(job.id).stopError);
+  assert.equal(service.status().busy, true);
+  assert.equal(service.captureStatus(job.id).jobStatus, 'scanning');
+  await assert.rejects(service.start(), { code: 'busy' });
 });
 
 test('multi-page and duplex scans preserve deterministic source order and unique jobs', async (t) => {
@@ -179,23 +232,37 @@ test('mode selection is authoritative; unavailable hardware never falls back to 
   await assert.rejects(service.setMode('twain'), { code: 'invalid_mode' });
 });
 
-test('hardware matching prefers exact profile ID and never uses an unrelated first device', () => {
+test('generic discovery accepts any WIA scanner without choosing an ambiguous first device; native profiles stay bound', () => {
   const unrelated = { id: 'other', name: 'Other scanner', driver: 'Wia' };
+  const native = {
+    ...fallbackProfile,
+    id: 'native-profile',
+    deviceName: brother.name,
+    deviceId: brother.id,
+  };
   assert.equal(matchDevice(fallbackProfile, []).state, 'device_not_found');
-  assert.equal(matchDevice(fallbackProfile, [unrelated]).state, 'device_not_found');
-  assert.equal(matchDevice(fallbackProfile, [unrelated, brother]).device.id, brother.id);
+  assert.equal(matchDevice(fallbackProfile, [unrelated]).device.id, unrelated.id);
+  assert.equal(matchDevice(fallbackProfile, [unrelated, brother]).state, 'ambiguous_device');
+  assert.equal(matchDevice(native, [unrelated]).state, 'device_not_found');
+  assert.equal(matchDevice(native, [unrelated, brother]).device.id, brother.id);
+  assert.equal(
+    matchDevice(fallbackProfile, [{ ...unrelated, driver: 'Twain' }]).state,
+    'device_not_found',
+  );
   assert.equal(
     matchDevice(fallbackProfile, [brother, { ...brother, id: 'second' }]).state,
     'ambiguous_device',
   );
   assert.equal(
-    matchDevice({ ...fallbackProfile, deviceId: 'second' }, [brother, { ...brother, id: 'second' }])
-      .device.id,
+    matchDevice({ ...native, deviceId: 'second' }, [brother, { ...brother, id: 'second' }]).device
+      .id,
     'second',
   );
+  assert.equal(matchDevice(native, [brother, unrelated], 'other').state, 'profile_mismatch');
   assert.equal(
-    matchDevice(fallbackProfile, [brother, unrelated], 'other').state,
+    matchDevice(native, [brother, { ...brother, id: 'second' }], 'second').state,
     'profile_mismatch',
+    'An exact ID cannot be overridden by a same-name scanner',
   );
   assert.equal(
     matchDevice(fallbackProfile, [brother, { ...brother, id: 'second' }], 'second').device.id,
@@ -226,7 +293,7 @@ test('real discovery, profile matching, disappearance, and refresh recovery use 
   let status = await provider.inspect();
   assert.equal(status.state, 'capabilities_verified');
   assert.equal(status.profiles.length, 2);
-  assert.equal(status.profileId, 'digitalarch-default');
+  assert.equal(status.profileId, native.id);
   assert.equal(status.profiles[1].deviceMatch.matched, true);
   assert.equal(scans, 0);
   await provider.inspect({ profileId: native.id });
@@ -250,7 +317,7 @@ test('combined real inspection uses one helper call and rechecks before scanning
       scans: null,
       inspect: async (profileId, deviceId) => {
         calls++;
-        assert.equal(profileId, fallbackProfile.id);
+        assert.equal(profileId, calls === 1 ? null : fallbackProfile.id);
         assert.equal(deviceId, null);
         return {
           profiles: [],
@@ -298,11 +365,190 @@ test('combined inspection retains inventory and controlled capability failures',
   });
   const status = await provider.inspect();
   assert.equal(status.canScan, false);
-  assert.equal(status.state, 'device_detected');
+  assert.equal(status.state, 'unsupported_profile');
   assert.equal(status.devices.length, 1);
   assert.equal(status.profiles.length, 2, 'Profiles are not duplicate physical scanners');
   assert.equal(status.profileWarnings[0], 'Read-only native settings');
   assert.equal((await provider.inspect({ profileId: native.id })).state, 'unsupported_profile');
+  const offline = realScanner({
+    prepare: async () => ({
+      inspect: async () => ({
+        profiles: [native],
+        devices: [],
+        profileId: null,
+        warnings: [],
+        probe: { success: false, error: { code: 'driver_error', message: 'WIA unavailable' } },
+      }),
+    }),
+  });
+  const failed = await offline.inspect();
+  assert.equal(failed.state, 'driver_error');
+  assert.equal(
+    failed.profiles.length,
+    2,
+    'Native inventory remains visible even when WIA enumeration fails',
+  );
+});
+
+test('discovery prefers native defaults, reports setting/device changes, and never replaces a removed selection', async () => {
+  const office = {
+    ...fallbackProfile,
+    id: 'office',
+    name: 'Office',
+    deviceId: brother.id,
+    revision: 'one',
+    isDefault: true,
+  };
+  let profiles = [office, { ...office, id: 'duplex', name: 'Duplex', isDefault: false }];
+  let devices = [brother];
+  const provider = realScanner({
+    prepare: async () =>
+      fakeBridge({
+        profiles: async () => ({ profiles, warnings: [], profileFiles: ['profiles.xml'] }),
+        devices: async () => ({ devices }),
+      }),
+  });
+  assert.equal((await provider.inspect()).profileId, 'office');
+  profiles = [
+    { ...office, revision: 'two', settings: { ...office.settings, dpi: 600 } },
+    profiles[1],
+  ];
+  let status = await provider.inspect({}, true);
+  assert.equal(status.profileId, 'office');
+  assert.equal(status.profiles.find((profile) => profile.id === 'office').settings.dpi, 600);
+  assert.match(status.inventoryChanges.join('\n'), /dpi: 300 → 600/);
+  assert.deepEqual(status.profileFiles, ['profiles.xml']);
+  devices = [];
+  status = await provider.inspect({}, true);
+  assert.equal(status.canScan, false);
+  assert.match(status.inventoryChanges.join('\n'), /Device removed/);
+  profiles = [profiles[1]];
+  status = await provider.inspect({}, true);
+  assert.equal(status.state, 'invalid_profile');
+  assert.equal(status.profileId, 'office');
+  assert.equal(status.canScan, false);
+  assert.match(status.inventoryChanges.join('\n'), /Profile removed: Office/);
+  devices = [brother];
+  const ambiguous = realScanner({
+    prepare: async () =>
+      fakeBridge({
+        profiles: async () => ({ profiles: [office, { ...office, id: 'another' }], warnings: [] }),
+      }),
+  });
+  assert.equal((await ambiguous.inspect()).state, 'profile_required');
+});
+
+test('profile changes after selection abort scan preflight before bridge capture', async () => {
+  const native = {
+    ...fallbackProfile,
+    id: 'office',
+    name: 'Office',
+    deviceId: brother.id,
+    revision: 'one',
+  };
+  let revision = 'one';
+  let scans = 0;
+  const provider = realScanner({
+    prepare: async () =>
+      fakeBridge({
+        profiles: async () => ({ profiles: [{ ...native, revision }], warnings: [] }),
+        scan: async () => {
+          scans++;
+        },
+      }),
+  });
+  await provider.inspect();
+  revision = 'two';
+  await assert.rejects(
+    provider.scan({
+      id: 'must-not-capture',
+      profileId: native.id,
+      profileRevision: 'one',
+      deviceId: brother.id,
+    }),
+    { code: 'profile_changed' },
+  );
+  assert.equal(scans, 0);
+});
+
+test('automatic inventory refresh is throttled, serialized and never runs while capture is active', async (t) => {
+  let now = 40000;
+  t.mock.method(Date, 'now', () => now);
+  let inspected = 0;
+  let releaseInspection;
+  let releaseCapture;
+  const snapshot = {
+    canScan: true,
+    state: 'capabilities_verified',
+    device: brother,
+    profileId: fallbackProfile.id,
+    profiles: [fallbackProfile],
+  };
+  const service = scannerService({
+    initialMode: 'real',
+    providers: {
+      real: {
+        snapshot: () => snapshot,
+        inspect: async (_selection, automatic) => {
+          inspected++;
+          if (automatic)
+            await new Promise((resolve) => {
+              releaseInspection = resolve;
+            });
+          return snapshot;
+        },
+        scan: () =>
+          new Promise((resolve) => {
+            releaseCapture = resolve;
+          }),
+      },
+    },
+  });
+  assert.equal(service.refreshIfNeeded().checking, true);
+  service.refreshIfNeeded();
+  assert.equal(inspected, 1);
+  releaseInspection();
+  await until(() => !service.status().checking);
+  now += 29999;
+  service.refreshIfNeeded();
+  assert.equal(inspected, 1);
+  await service.start();
+  const afterPreflight = inspected;
+  now += 40000;
+  service.refreshIfNeeded();
+  assert.equal(inspected, afterPreflight);
+  releaseCapture();
+});
+
+test('changed scan preflight cannot create a capture session with stale settings', async () => {
+  let revision = 'old';
+  let committed = 0;
+  const snapshot = () => ({
+    canScan: true,
+    device: brother,
+    profileId: 'office',
+    profiles: [{ ...fallbackProfile, id: 'office', revision }],
+  });
+  const service = scannerService({
+    initialMode: 'real',
+    providers: {
+      real: {
+        snapshot,
+        inspect: async () => {
+          revision = 'new';
+          return snapshot();
+        },
+      },
+    },
+  });
+  await assert.rejects(
+    service.start({}, async () => {
+      committed++;
+    }),
+    { code: 'profile_changed' },
+  );
+  assert.equal(committed, 0);
+  assert.equal(service.status().busy, false);
 });
 
 test('driver/helper/capability failures and unsupported native settings are explicit', async () => {

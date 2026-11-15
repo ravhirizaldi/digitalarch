@@ -9,6 +9,7 @@ import { qualityControl } from './qc.mjs';
 import { approvals } from './approvals.mjs';
 import { viewerWorkspace } from './viewer.mjs';
 import { isViewer, viewerAudit } from './viewer-audit.mjs';
+import { staffNotifications } from './notifications.mjs';
 
 export function enterprise({
   scanner,
@@ -18,6 +19,7 @@ export function enterprise({
   ocr: ocrOptions = {},
 }) {
   const auth = authentication(pool);
+  const notifications = staffNotifications(pool, auth);
   const admin = administration(pool, auth);
   const storage = captureStorage(storageRoot);
   let lock;
@@ -52,11 +54,13 @@ export function enterprise({
         await connection.query('SELECT id FROM archive_batches LIMIT 1');
         lock = connection;
         lock.on('error', () => {
+          notifications.disconnect();
           ocr.interrupt();
           initialization = null;
           lock = null;
           connection.release(true);
         });
+        await notifications.listen(connection);
         await ocr.initializeDefaults();
         await viewer.initialize();
         await batches.recover();
@@ -95,6 +99,7 @@ export function enterprise({
     qc,
     approval,
     viewer,
+    notifications,
     ready: ensure,
     async start() {
       try {
@@ -123,6 +128,7 @@ export function enterprise({
     async close() {
       closed = true;
       clearInterval(timer);
+      await notifications.close();
       await ocr.close();
       while (sweeping) await new Promise((resolve) => setTimeout(resolve, 10));
       await viewer.close();
@@ -156,6 +162,16 @@ export function enterprise({
         if (method !== 'GET') auth.csrf(req, context.session);
         if (pathname === '/api/auth/me' && method === 'GET')
           return { user: context.user, csrfToken: context.csrfToken };
+        if (
+          method !== 'GET' &&
+          !/^\/api\/batches\/[^/]+\/cancel-scan$/.test(pathname) &&
+          (await batches.running(user))
+        )
+          throw failure(
+            'scan_in_progress',
+            'Capture is in progress. Only Cancel scan is available until capture and page reconciliation finish.',
+            409,
+          );
         if (pathname === '/api/auth/logout' && method === 'POST') {
           keys(body, []);
           return await auth.logout(context, res);
@@ -169,6 +185,17 @@ export function enterprise({
             403,
           );
         const permit = (permission) => requirePermission(user, permission);
+        if (pathname === '/api/notifications/stream' && method === 'GET')
+          return notifications.stream(req, res, user);
+        if (pathname === '/api/notifications/summary' && method === 'GET')
+          return await notifications.summary(user);
+        if (pathname === '/api/notifications') {
+          if (method === 'GET') return await notifications.list(user, url.searchParams);
+          if (method === 'POST') return await notifications.update(user, null, body);
+        }
+        const notification = pathname.match(/^\/api\/notifications\/([^/]+)$/);
+        if (notification && method === 'POST')
+          return await notifications.update(user, notification[1], body);
         if (pathname === '/api/admin/viewer-registrations' && method === 'GET')
           return await viewer.registrations(user, url.searchParams.get('status') || 'pending');
         const registration = pathname.match(/^\/api\/admin\/viewer-registrations\/([^/]+)$/);
@@ -421,7 +448,7 @@ export function enterprise({
         }
         if (pathname === '/api/scanner/status' && method === 'GET') {
           permit('scanner:read');
-          return scanner.status();
+          return { ...scanner.refreshIfNeeded(), capture: await batches.running(user) };
         }
         if (pathname === '/api/scanner/mode' && method === 'POST') {
           permit('scanner:configure');
@@ -476,7 +503,7 @@ export function enterprise({
           }
         }
         const batch = pathname.match(
-          /^\/api\/batches\/([^/]+)(?:\/(resume|pause|complete-capture|submit-qc|resubmit-qc|cancel|scan-sessions|pages|reassign|delete|ocr|replacement|reorder))?$/,
+          /^\/api\/batches\/([^/]+)(?:\/(resume|pause|complete-capture|submit-qc|resubmit-qc|cancel|cancel-scan|scan-sessions|pages|reassign|delete|ocr|replacement|reorder))?$/,
         );
         if (batch) {
           const [, id, operation] = batch;
@@ -493,10 +520,14 @@ export function enterprise({
                 : result;
           }
           if (method === 'PATCH' && !operation) {
-            permit('batches:update');
+            if (!user.permissions.includes('batches:update')) permit('qc:review');
             return await batches.location(user, id, body);
           }
           if (method === 'POST') {
+            if (operation === 'cancel-scan') {
+              permit('batches:update');
+              return await batches.cancelScan(user, id, body);
+            }
             if (operation === 'replacement' || operation === 'reorder') {
               permit('batches:update');
               return await batches[operation](user, id, body);

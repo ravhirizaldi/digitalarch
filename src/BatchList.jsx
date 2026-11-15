@@ -91,6 +91,7 @@ const activityLabels = {
   'batch.reassigned': 'Batch reassigned',
   'batch.deleted': 'Batch deleted',
   'scan_session.started': 'Session started',
+  'scan_session.cancel_requested': 'Scan cancellation requested',
   'scan_session.completed': 'Session completed',
   'scan_session.partial': 'Session partially captured',
   'scan_session.failed': 'Session failed',
@@ -393,7 +394,7 @@ export default function BatchList({
               type="text"
               disabled={creating || loading}
               onClick={() =>
-                batch.workflow_status === 'rework' && batch.status === 'capture_completed'
+                batch.workflow_status === 'rework' && onDocument
                   ? onDocument(batch.id)
                   : onOpen(batch)
               }

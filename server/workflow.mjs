@@ -15,6 +15,49 @@ export async function documentFor(client, batchId, lock = false) {
   ).rows[0];
 }
 
+export function unchangedReworkCapture(doc, review, pages, sessions) {
+  const previous = review?.snapshot?.pages;
+  if (
+    doc.workflow_status !== 'rework' ||
+    review?.outcome !== 'returned' ||
+    review.cycle !== doc.review_cycle ||
+    !Array.isArray(previous) ||
+    !previous.length ||
+    previous.some((page) => !page)
+  )
+    return false;
+  // Older snapshots can only prove sessions represented by their included pages.
+  const captured = new Set(
+    review.snapshot.captureSessions ?? previous.map((page) => page.scan_session_id),
+  );
+  if (
+    captured.size !== sessions.length ||
+    sessions.some(
+      (session) =>
+        !captured.has(session.id) ||
+        session.status === 'running' ||
+        session.recovery_pending ||
+        session.replacement_status === 'pending',
+    )
+  )
+    return false;
+  const included = pages.filter((page) => !page.is_excluded && !page.replacement_candidate);
+  const snapshot = new Map(previous.map((page) => [page.id, page]));
+  return (
+    snapshot.size === previous.length &&
+    included.length > 0 &&
+    included.every((page) => {
+      const old = snapshot.get(page.id);
+      return (
+        old &&
+        page.image_revision === old.image_revision &&
+        page.rotation_degrees === old.rotation_degrees &&
+        page.active_image_sha256 === old.active_image_sha256
+      );
+    })
+  );
+}
+
 export const submittedBatch = `EXISTS(SELECT 1 FROM documents submitted_document
   JOIN qc_reviews submitted_review ON submitted_review.document_id=submitted_document.id
     AND submitted_review.cycle=submitted_document.review_cycle
@@ -44,6 +87,95 @@ export async function operatorEdit(client, user, batch) {
       409,
     );
   return doc;
+}
+
+export function operatorFieldLocked(field, qcEditors = []) {
+  return (
+    field.verification === 'verified' ||
+    (field.operatorLocked ?? qcEditors.includes(field.editedBy))
+  );
+}
+
+export async function reworkLocks(client, doc) {
+  const qcEditors = (
+    await client.query(
+      "SELECT DISTINCT actor_id FROM audit_logs WHERE batch_id=$1 AND action='qc.claimed'",
+      [doc.batch_id],
+    )
+  ).rows.map((row) => row.actor_id);
+  const review = (
+    await client.query('SELECT * FROM qc_reviews WHERE document_id=$1 AND cycle=$2', [
+      doc.id,
+      doc.review_cycle,
+    ])
+  ).rows[0];
+  const reviewed = review
+    ? (
+        await client.query(
+          `SELECT p.id FROM qc_page_reviews pr JOIN pages p ON p.id=pr.page_id
+     WHERE pr.review_id=$1 AND pr.status='reviewed' AND pr.image_revision=p.image_revision`,
+          [review.id],
+        )
+      ).rows
+    : [];
+  const fields = doc.metadata_json?.fields || [];
+  const lockedFieldIds = fields
+    .filter((field) => operatorFieldLocked(field, qcEditors))
+    .map((field) => field.id);
+  return {
+    metadataLocked: !!review?.metadata_reviewed,
+    orderingLocked: !!review?.ordering_reviewed,
+    completenessLocked: !!review?.completeness_reviewed,
+    lockedFieldIds,
+    locationLocked:
+      !!review?.metadata_reviewed ||
+      fields.some(
+        (field) => field.type === 'physical_location' && lockedFieldIds.includes(field.id),
+      ),
+    reviewedPageIds: reviewed.map((page) => page.id),
+  };
+}
+
+export function assertReworkAction(locks, action, pageId) {
+  const metadata = action === 'metadata' || action === 'location';
+  const membership = ['capture', 'remove', 'exclude', 'restore', 'replacement'].includes(action);
+  if (
+    (metadata && locks.metadataLocked) ||
+    (action === 'reorder' && locks.orderingLocked) ||
+    (membership && (locks.orderingLocked || locks.completenessLocked)) ||
+    ([
+      'rename',
+      'rotate-left',
+      'rotate-right',
+      'reset-rotation',
+      'replacement',
+      'remove',
+      'exclude',
+    ].includes(action) &&
+      locks.reviewedPageIds.includes(pageId))
+  )
+    throw failure(
+      'qc_locked',
+      'QC has reviewed this item. QC must reopen it before operator changes.',
+      409,
+    );
+}
+
+export async function operatorAction(client, doc, action, pageId) {
+  const locks = await reworkLocks(client, doc);
+  assertReworkAction(locks, action, pageId);
+  if (
+    action === 'location' &&
+    (doc.metadata_json?.fields || []).some(
+      (field) => field.type === 'physical_location' && locks.lockedFieldIds.includes(field.id),
+    )
+  )
+    throw failure(
+      'qc_locked',
+      'QC has protected this physical location. QC must reopen the field first.',
+      409,
+    );
+  return locks;
 }
 
 export async function bumpDocument(client, batchId) {

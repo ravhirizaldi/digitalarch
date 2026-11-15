@@ -1,80 +1,14 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, App, Button, Descriptions, Spin, Tag } from 'antd';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Alert, Button, Descriptions, Spin, Tag } from 'antd';
 import {
   ArrowLeftOutlined,
+  DownloadOutlined,
   PrinterOutlined,
-  QrcodeOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
 import { api } from './api';
 import { dateTime, IconButton } from './ui';
 
-export function ApprovalNotifications({ user, onOpen }) {
-  const { notification } = App.useApp();
-  const seen = useRef(new Map());
-  const open = useRef(onOpen);
-  open.current = onOpen;
-  useEffect(() => {
-    if (!user.permissions.includes('batches:read') || !user.permissions.includes('documents:read'))
-      return;
-    let active = true;
-    const shown = new Set();
-    async function load() {
-      try {
-        const { notifications } = await api('/api/approval-notifications');
-        if (!active) return;
-        for (const item of notifications) {
-          const state = `${item.review_cycle}:${item.workflow_status}`;
-          const previous = seen.current.get(item.id);
-          if (previous?.dismissed || previous?.state === state) continue;
-          seen.current.set(item.id, { state });
-          shown.add(item.id);
-          const historical =
-            item.cycle !== item.review_cycle ||
-            item.workflow_status === 'dropped' ||
-            item.workflow_status === 'qc_waiting' ||
-            item.workflow_status === 'qc_in_review' ||
-            item.workflow_status === 'rework';
-          notification.info({
-            key: `approval-${item.id}`,
-            title: `${item.batch_code} · L${item.level} confirmed`,
-            description: historical
-              ? 'A historical confirmation QR is available; this is not the current publication approval.'
-              : item.final
-                ? 'Publication was confirmed. Your QR receipt is ready to print.'
-                : item.workflow_status === 'approved'
-                  ? 'L1 confirmed this revision; publication was subsequently confirmed by L2.'
-                  : 'L1 confirmed this revision. L2 confirmation is still required.',
-            duration: 0,
-            actions: (
-              <Button icon={<QrcodeOutlined aria-hidden />} onClick={() => open.current(item.id)}>
-                View / print QR
-              </Button>
-            ),
-            onClose: () => {
-              seen.current.set(item.id, { state, dismissed: true });
-              api(`/api/confirmations/${item.id}/dismiss`, {}).catch(() =>
-                seen.current.delete(item.id),
-              );
-            },
-          });
-        }
-      } catch {
-        /* Retry the read-only notification poll without affecting capture. */
-      }
-    }
-    load();
-    const timer = setInterval(() => {
-      if (!document.hidden) load();
-    }, 15000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-      for (const id of shown) notification.destroy(`approval-${id}`);
-    };
-  }, [user, notification]);
-  return null;
-}
 export default function ApprovalConfirmation({ id, onBack, onOpenDocument }) {
   const [receipt, setReceipt] = useState(null);
   const [error, setError] = useState('');
@@ -116,6 +50,14 @@ export default function ApprovalConfirmation({ id, onBack, onOpenDocument }) {
         {receipt && (
           <>
             <Button onClick={() => onOpenDocument(receipt.batch_id)}>View document</Button>
+            <Button
+              icon={<DownloadOutlined aria-hidden />}
+              href={`/api/confirmations/${id}/qr`}
+              download={`DigitalArch-${receipt.batch_code}-L${receipt.level}.png`}
+              disabled={!qrReady || !!error}
+            >
+              Download QR
+            </Button>
             <Button
               type="primary"
               icon={<PrinterOutlined aria-hidden />}

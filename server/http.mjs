@@ -70,6 +70,7 @@ export function createHttpApp(service, publicDir = path.resolve('dist')) {
           url,
           mutation ? await readBody(req) : undefined,
         );
+        if (result?.streaming) return;
         if (result?.onComplete) {
           let called = false;
           const started = Date.now();

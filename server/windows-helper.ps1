@@ -28,6 +28,10 @@ try {
       if ($watch.ElapsedMilliseconds -ge [int]$request.timeoutMs -or ($request.cancelFile -and (Test-Path -LiteralPath $request.cancelFile))) {
         # Linux killing powershell alone does not reliably terminate its Windows children.
         & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F 2>&1 | Out-Null
+        if ((@($request.args) -contains '--scan') -and -not $process.WaitForExit(5000)) {
+          Write-Output '{"success":false,"error":{"code":"capture_stop_unconfirmed","message":"Windows could not confirm capture termination. Keep the scanner idle; an administrator must verify the helper has stopped before restarting DigitalArch."}}'
+          exit 1
+        }
         Write-Output '{"success":false,"error":{"code":"timeout","message":"Helper operation timed out or was stopped. Original files are retained."}}'
         exit 1
       }

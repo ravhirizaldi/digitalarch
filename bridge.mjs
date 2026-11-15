@@ -120,8 +120,10 @@ export async function prepareScanner() {
     }
     if (processError?.killed)
       throw failure(
-        'timeout',
-        'Scanner helper timed out. Check the scanner before retrying. Saved pages are retained.',
+        args.includes('--scan') ? 'capture_stop_unconfirmed' : 'timeout',
+        args.includes('--scan')
+          ? 'Capture termination could not be confirmed. An administrator must verify the Windows helper has stopped before restarting DigitalArch. Saved pages are retained.'
+          : 'Scanner helper timed out. Check the scanner before retrying. Saved pages are retained.',
       );
     let messages;
     try {
@@ -182,8 +184,7 @@ export async function prepareScanner() {
     inspect: (profileId, deviceId) =>
       invoke([
         '--inspect',
-        '--profile',
-        profileId,
+        ...(profileId ? ['--profile', profileId] : []),
         ...(deviceId ? ['--device', deviceId] : []),
         ...(process.env.DIGITALARCH_NAPS2_PROFILES
           ? ['--profile-file', process.env.DIGITALARCH_NAPS2_PROFILES]
@@ -208,20 +209,21 @@ export async function prepareScanner() {
           ? ['--profile-file', process.env.DIGITALARCH_NAPS2_PROFILES]
           : []),
       ]),
-    scan: (id, { profileId = 'digitalarch-default', deviceId } = {}) =>
+    scan: (id, { profileId, deviceId, profileRevision, signal } = {}) =>
       invoke(
         [
           '--scan',
           '--output',
           `${windowsRoot}\\scans\\${id}.png`,
-          '--profile',
-          profileId,
+          ...(profileId ? ['--profile', profileId] : []),
+          ...(profileRevision ? ['--profile-revision', profileRevision] : []),
           ...(deviceId ? ['--device', deviceId] : []),
           ...(process.env.DIGITALARCH_NAPS2_PROFILES
             ? ['--profile-file', process.env.DIGITALARCH_NAPS2_PROFILES]
             : []),
         ],
         10 * 60 * 1000,
+        signal,
       ),
   };
 }

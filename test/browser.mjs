@@ -262,7 +262,22 @@ try {
   );
   await page.getByRole('button', { name: 'Scan feeder', exact: true }).click();
   assert.equal((await started).status(), 200);
+  const scanProgress = page
+    .getByRole('dialog')
+    .filter({ has: page.getByRole('button', { name: 'Cancel scan', exact: true }) });
+  await scanProgress.waitFor();
+  assert.equal(
+    await scanProgress.getByRole('button').count(),
+    1,
+    'Cancel is the only scan-dialog action',
+  );
+  assert.equal(await page.locator('.app-shell').evaluate((element) => element.inert), true);
+  await page.keyboard.press('Escape');
+  assert.equal(await scanProgress.isVisible(), true, 'Escape cannot dismiss scan progress');
+  const acceptReload = (dialog) => dialog.accept();
+  page.on('dialog', acceptReload);
   await page.reload();
+  page.off('dialog', acceptReload);
   await captureFinished(1, 4);
   assert.equal(
     (await f.pool.query('SELECT count(*)::int AS count FROM archive_batches')).rows[0].count,
@@ -461,6 +476,20 @@ try {
     .waitFor();
   assert.equal(await page.locator('.scanner-page').count(), 0);
   await page.unroute('**/api/batches');
+  await page.getByRole('button', { name: 'Advanced scanner settings', exact: true }).click();
+  await page.getByLabel('Page Delay (ms)', { exact: true }).fill('2000');
+  await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+  await choose('Simulation Scenario', 'Multi-page Feeder');
+  await page.getByRole('button', { name: 'Scan feeder', exact: true }).click();
+  await page.getByRole('dialog').getByText('1 page captured', { exact: true }).waitFor();
+  await page.getByRole('dialog').getByRole('button', { name: 'Cancel scan', exact: true }).click();
+  await page
+    .getByRole('dialog')
+    .filter({ has: page.getByRole('button', { name: /Cancel.*scan/ }) })
+    .waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('.app-shell').evaluate((element) => element.inert), false);
+  assert.ok(Number(await page.locator('[aria-label="Captured page count"]').innerText()) >= 1);
+  await page.getByRole('button', { name: 'Save & Exit', exact: true }).click();
   await page.getByRole('button', { name: 'Sign out', exact: true }).click();
   await signIn('browser-admin', adminPassword);
   await page.getByRole('heading', { name: 'Users', exact: true }).waitFor();

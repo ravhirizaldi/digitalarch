@@ -8,6 +8,8 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
   let mode = initialMode;
   let checking = false;
   let current = null;
+  let captureController = null;
+  let lastDiscoveryAt = 0;
   const jobs = new Map();
   const snapshots = {};
   const idle = () => {
@@ -42,7 +44,19 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
         canScan: !!snapshot.canScan && !checking && current?.status !== 'scanning',
       };
     },
-    async refresh(selection = {}) {
+    refreshIfNeeded() {
+      if (
+        mode === 'real' &&
+        !checking &&
+        current?.status !== 'scanning' &&
+        Date.now() - lastDiscoveryAt >= 30000
+      )
+        api
+          .refresh({}, true)
+          .catch((error) => console.error('Automatic scanner discovery:', error.message));
+      return api.status();
+    },
+    async refresh(selection = {}, automatic = false) {
       idle();
       if (mode === 'simulator' && Object.keys(selection).length)
         throw failure(
@@ -51,11 +65,12 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
         );
       checking = true;
       try {
-        snapshots[mode] = await providers[mode].inspect(selection);
+        snapshots[mode] = await providers[mode].inspect(selection, automatic);
         if (mode === 'real' && dataDir && providers.real.scans)
           await writeJson(dataDir, 'storage.json', { real: providers.real.scans });
         return snapshots[mode];
       } finally {
+        lastDiscoveryAt = Date.now();
         checking = false;
       }
     },
@@ -73,12 +88,38 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
       const normalized =
         mode === 'simulator' ? { scenario: 'multi', pageDelay: 500, ...options } : options;
       provider.validate?.(normalized);
+      if (mode === 'real') {
+        const previous = api.status();
+        const revision = previous.profiles?.find(
+          (profile) => profile.id === previous.profileId,
+        )?.revision;
+        await api.refresh();
+        const selected = api.status();
+        provider.validate?.(normalized);
+        if (previous.device?.id !== selected.device?.id)
+          throw failure(
+            'device_changed',
+            'The selected scanner changed. Review the detected device before starting capture.',
+            409,
+          );
+        if (
+          revision !==
+          selected.profiles?.find((profile) => profile.id === selected.profileId)?.revision
+        )
+          throw failure(
+            'profile_changed',
+            'The profile changed. Review its updated settings before starting capture.',
+            409,
+          );
+      }
       const selected = api.status();
       const job = {
         id: `scan-${Date.now()}-${sessionId}`,
         provider: mode,
         deviceId: selected.device?.id || null,
         profileId: selected.profileId || null,
+        profileRevision:
+          selected.profiles?.find((profile) => profile.id === selected.profileId)?.revision || null,
         status: 'scanning',
         error: null,
         errorCode: null,
@@ -88,23 +129,47 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
         totalPages: null,
       };
       current = job;
+      const controller = new AbortController();
+      captureController = controller;
       jobs.set(job.id, job);
       try {
         // The application commits its database session before capture can consume paper.
         if (beforeStart) await beforeStart({ ...job });
       } catch (error) {
         current = null;
+        captureController = null;
         jobs.delete(job.id);
         throw error;
       }
       const response = { ...job };
+      const cancelled = () => {
+        job.status = 'cancelled';
+        job.errorCode = 'scan_cancelled';
+        job.error =
+          'Scan cancelled. Captured pages are retained. Check the scanner before starting another session.';
+      };
       Promise.resolve()
-        .then(() => provider.scan(job, normalized))
+        .then(() => {
+          controller.signal.throwIfAborted();
+          return provider.scan(job, normalized, controller.signal);
+        })
         .then(
           () => {
-            job.status = 'complete';
+            if (controller.signal.aborted) cancelled();
+            else job.status = 'complete';
           },
           (error) => {
+            if (error.code === 'capture_stop_unconfirmed') {
+              // Unknown process termination must not unlock capture or stop file reconciliation.
+              job.cancelRequested = true;
+              job.errorCode = error.code;
+              job.error = error.message;
+              return;
+            }
+            if (controller.signal.aborted) {
+              cancelled();
+              return;
+            }
             if (!error.statusCode) console.error('Scan job failed:', error);
             const problem = publicError(error);
             job.status = 'error';
@@ -113,9 +178,38 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
           },
         )
         .then(() => {
+          if (job.status === 'scanning') return;
           job.completedAt = new Date().toISOString();
+          if (current === job) captureController = null;
         });
       return response;
+    },
+    captureStatus(id) {
+      const job = jobs.get(id);
+      return {
+        jobStatus: job?.status || 'unknown',
+        cancelRequested: !!job?.cancelRequested,
+        stopError: job?.errorCode === 'capture_stop_unconfirmed' ? job.error : null,
+      };
+    },
+    cancel(id) {
+      if (!jobName.test(id) || !jobs.has(id))
+        throw failure(
+          'capture_unavailable',
+          'Capture state is being reconciled. Wait for recovery before retrying.',
+          409,
+        );
+      const job = jobs.get(id);
+      if (job.status !== 'scanning' || job.cancelRequested) return false;
+      if (current !== job || !captureController)
+        throw failure(
+          'capture_unavailable',
+          'The capture process could not be identified safely.',
+          409,
+        );
+      job.cancelRequested = true;
+      captureController.abort();
+      return true;
     },
     async job(id) {
       if (!jobName.test(id) || !jobs.has(id))

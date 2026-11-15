@@ -10,8 +10,15 @@ import {
   setPageLabel,
   submittedBatch,
   requireSubmission,
+  documentFor,
+  qcOfficer,
+  activeReview,
+  unchangedReworkCapture,
+  operatorAction,
+  reworkLocks,
 } from './workflow.mjs';
 import { fieldsOf, persistMetadata } from './qc-metadata.mjs';
+import { queueCaptureOcr } from './capture-ocr.mjs';
 
 export function batchCode(now = new Date()) {
   const parts = Object.fromEntries(
@@ -104,6 +111,51 @@ export function batchOperations(
     await bumpDocument(client, id);
   }
   const api = {
+    async running(user) {
+      const session = (
+        await pool.query(
+          `SELECT s.id,s.batch_id,s.created_by,s.session_number,s.page_count,s.scanner_mode,s.device_name,s.profile_name,s.job_id
+         FROM scan_sessions s JOIN archive_batches b ON b.id=s.batch_id
+         WHERE s.created_by=$1 AND b.assigned_operator_id=$1 AND b.deleted_at IS NULL AND s.status='running'
+         ORDER BY s.started_at LIMIT 1`,
+          [user.id],
+        )
+      ).rows[0];
+      return session ? { ...session, ...scanner.captureStatus(session.job_id) } : null;
+    },
+    async cancelScan(user, id, body) {
+      uuid(id);
+      keys(body, ['sessionId']);
+      uuid(body.sessionId);
+      requirePermission(user, 'scanner:scan');
+      const session = await transaction(pool, async (client) => {
+        const batch = (
+          await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
+        ).rows[0];
+        ownership(user, batch, true);
+        const session = (
+          await client.query('SELECT * FROM scan_sessions WHERE id=$1 AND batch_id=$2 FOR UPDATE', [
+            body.sessionId,
+            id,
+          ])
+        ).rows[0];
+        if (!session || session.created_by !== user.id)
+          throw failure('not_found', 'Capture session not found.', 404);
+        if (session.status === 'running' && !scanner.captureStatus(session.job_id).cancelRequested)
+          await audit(
+            client,
+            user,
+            'scan_session.cancel_requested',
+            'scan_session',
+            session.id,
+            {},
+            id,
+          );
+        return session;
+      });
+      if (session.status === 'running') scanner.cancel(session.job_id);
+      return api.get(user, id);
+    },
     async get(user, id) {
       uuid(id);
       return transaction(pool, async (client) => {
@@ -124,7 +176,12 @@ export function batchOperations(
             [id],
           )
         ).rows;
-        return { batch, sessions, pages };
+        return {
+          batch,
+          sessions,
+          pages,
+          operator_locks: await reworkLocks(client, await documentFor(client, id)),
+        };
       });
     },
     async list(
@@ -232,38 +289,61 @@ export function batchOperations(
         const batch = (
           await client.query('SELECT * FROM archive_batches WHERE id=$1 FOR UPDATE', [id])
         ).rows[0];
-        ownership(user, batch, true);
+        if (!batch || batch.deleted_at) throw failure('not_found', 'Batch not found.', 404);
         mutable(batch, true);
-        const doc = await operatorEdit(client, user, batch);
+        const doc = await documentFor(client, id, true);
+        if (doc?.workflow_status === 'qc_in_review') {
+          await qcOfficer(client, batch, user.id);
+          await activeReview(client, doc, user);
+        } else {
+          await operatorEdit(client, user, batch);
+          await operatorAction(client, doc, 'location');
+        }
         version(batch, body.version);
         await noRunning(client, id);
         await client.query('UPDATE archive_batches SET physical_location=$2 WHERE id=$1', [
           id,
           location,
         ]);
-        const existing = fieldsOf(doc).find((field) => field.type === 'physical_location');
-        if (existing)
+        const qc = doc.workflow_status === 'qc_in_review';
+        const existing =
+          fieldsOf(doc).find((field) => field.type === 'physical_location') ||
+          (qc && location ? { id: randomUUID(), type: 'physical_location', context: '' } : null);
+        if (existing) {
+          const fields = fieldsOf(doc).some((field) => field.id === existing.id)
+            ? fieldsOf(doc)
+            : [...fieldsOf(doc), existing];
+          if (fields.length > 200)
+            throw failure(
+              'invalid_request',
+              'At most 200 metadata fields are allowed. Remove an unused field before adding a QC location.',
+            );
           await persistMetadata(
             client,
             doc,
             location
-              ? fieldsOf(doc).map((field) =>
+              ? fields.map((field) =>
                   field.id === existing.id
                     ? {
                         ...field,
                         value: location,
                         origin: 'manual',
                         verification: 'needs_review',
+                        operatorLocked: qc,
+                        verifiedBy: null,
+                        verifiedByName: null,
+                        verifiedAt: null,
                         editedBy: user.id,
                         editedByName: user.display_name,
                         editedAt: new Date().toISOString(),
                       }
                     : field,
                 )
-              : fieldsOf(doc).filter((field) => field.id !== existing.id),
+              : fields.filter((field) => field.id !== existing.id),
             user,
             'metadata.updated',
           );
+        }
         await bump(client, id);
         await audit(
           client,
@@ -297,7 +377,7 @@ export function batchOperations(
           return;
         }
         mutable(batch);
-        await operatorEdit(client, user, batch);
+        const doc = await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
         const states = {
@@ -345,7 +425,7 @@ export function batchOperations(
         );
         await bump(client, id);
         if (operation === 'complete-capture')
-          await client.query('SELECT queue_batch_ocr($1,$2,$3)', [id, ocrLanguage, ocrConfig]);
+          await queueCaptureOcr(client, storage, doc, ocrLanguage, ocrConfig);
         await audit(
           client,
           user,
@@ -385,13 +465,35 @@ export function batchOperations(
               : 'Complete capture before sending this document to QC.',
             409,
           );
-        if (batch.status !== 'capture_completed')
+        await noCapture(client, id);
+        const pages = (
+          await client.query(
+            'SELECT * FROM pages WHERE batch_id=$1 AND NOT is_excluded AND NOT replacement_candidate',
+            [id],
+          )
+        ).rows;
+        let reuseCapture = false;
+        if (resubmit && ['in_progress', 'paused'].includes(batch.status)) {
+          const review = (
+            await client.query('SELECT * FROM qc_reviews WHERE document_id=$1 AND cycle=$2', [
+              doc.id,
+              doc.review_cycle,
+            ])
+          ).rows[0];
+          const sessions = (
+            await client.query(
+              'SELECT id,status,recovery_pending,replacement_status FROM scan_sessions WHERE batch_id=$1',
+              [id],
+            )
+          ).rows;
+          reuseCapture = unchangedReworkCapture(doc, review, pages, sessions);
+        }
+        if (batch.status !== 'capture_completed' && !reuseCapture)
           throw failure(
             'capture_pending',
-            'Complete capture before sending this document to QC.',
+            'Complete capture for new or changed page images before sending to QC. Unchanged retained images can be resubmitted directly.',
             409,
           );
-        await noCapture(client, id);
         const jobs = (await client.query('SELECT status FROM ocr_jobs WHERE batch_id=$1', [id]))
           .rows;
         if (
@@ -406,12 +508,6 @@ export function batchOperations(
             'Wait for OCR to finish. Resume paused OCR or cancel an unleased queued run before sending to QC.',
             409,
           );
-        const pages = (
-          await client.query(
-            'SELECT * FROM pages WHERE batch_id=$1 AND NOT is_excluded AND NOT replacement_candidate',
-            [id],
-          )
-        ).rows;
         if (!pages.length)
           throw failure(
             'empty_batch',
@@ -419,6 +515,10 @@ export function batchOperations(
             409,
           );
         for (const page of pages) await storage.validate(page);
+        if (reuseCapture)
+          await client.query("UPDATE archive_batches SET status='capture_completed' WHERE id=$1", [
+            id,
+          ]);
         await client.query(
           `INSERT INTO qc_reviews(document_id,cycle,submitted_by,submitted_at) VALUES($1,$2,$3,now())`,
           [doc.id, doc.review_cycle + 1, user.id],
@@ -428,13 +528,31 @@ export function batchOperations(
           [doc.id],
         );
         await bump(client, id);
+        if (resubmit) {
+          await client.query(
+            `UPDATE qc_reviews next SET metadata_reviewed=previous.metadata_reviewed,
+             ordering_reviewed=previous.ordering_reviewed,completeness_reviewed=previous.completeness_reviewed
+             FROM qc_reviews previous WHERE next.document_id=$1 AND next.cycle=$2
+             AND previous.document_id=next.document_id AND previous.cycle=$2-1`,
+            [doc.id, doc.review_cycle + 1],
+          );
+          await client.query(
+            `INSERT INTO qc_page_reviews(review_id,page_id,status,image_revision,reviewed_by,reviewed_at)
+             SELECT next.id,pr.page_id,pr.status,pr.image_revision,pr.reviewed_by,pr.reviewed_at
+             FROM qc_reviews previous JOIN qc_page_reviews pr ON pr.review_id=previous.id
+             JOIN pages p ON p.id=pr.page_id AND p.image_revision=pr.image_revision
+             JOIN qc_reviews next ON next.document_id=previous.document_id AND next.cycle=$2
+             WHERE previous.document_id=$1 AND previous.cycle=$2-1 AND NOT p.is_excluded AND NOT p.replacement_candidate`,
+            [doc.id, doc.review_cycle + 1],
+          );
+        }
         await audit(
           client,
           user,
           resubmit ? 'qc.resubmitted' : 'qc.submitted',
           'document',
           doc.id,
-          { cycle: doc.review_cycle + 1, revision: doc.revision + 1 },
+          { cycle: doc.review_cycle + 1, revision: doc.revision + 1, reusedCapture: reuseCapture },
           id,
         );
       });
@@ -529,7 +647,13 @@ export function batchOperations(
             ).rows[0];
             ownership(user, batch, true);
             mutable(batch);
-            await operatorEdit(client, user, batch);
+            const doc = await operatorEdit(client, user, batch);
+            await operatorAction(
+              client,
+              doc,
+              body.replacementPageId ? 'replacement' : 'capture',
+              body.replacementPageId,
+            );
             version(batch, body.version);
             if (batch.status !== 'in_progress')
               throw failure('batch_paused', 'Resume this batch before scanning.', 409);
@@ -584,7 +708,11 @@ export function batchOperations(
                 selected.device?.name,
                 job.profileId,
                 profile?.name,
-                { ...job.options, profileSettings: profile?.settings || null },
+                {
+                  ...job.options,
+                  profileSettings: profile?.settings || null,
+                  profileRevision: job.profileRevision,
+                },
                 job.id,
                 base,
               ],
@@ -720,7 +848,7 @@ export function batchOperations(
                 : null);
           const status = !ended
             ? 'running'
-            : interrupted || !job
+            : interrupted || !job || job.errorCode === 'scan_cancelled'
               ? 'interrupted'
               : error
                 ? count
@@ -834,13 +962,14 @@ export function batchOperations(
         ).rows[0];
         ownership(user, batch, true);
         mutable(batch, true);
-        await operatorEdit(client, user, batch);
+        const doc = await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, batchId);
         const page = (await client.query('SELECT * FROM pages WHERE id=$1 FOR UPDATE', [id]))
           .rows[0];
         if (page.replacement_candidate)
           throw failure('replacement_pending', 'Confirm or cancel this replacement first.', 409);
+        await operatorAction(client, doc, body.action, page.id);
         if (body.action === 'rename') {
           await noCapture(client, batchId);
           await setPageLabel(client, user, page, body.label);
@@ -887,7 +1016,7 @@ export function batchOperations(
         ).rows[0];
         ownership(user, batch, true);
         mutable(batch);
-        await operatorEdit(client, user, batch);
+        const doc = await operatorEdit(client, user, batch);
         version(batch, body.version);
         await noRunning(client, id);
         const session = (
@@ -898,6 +1027,7 @@ export function batchOperations(
         ).rows[0];
         if (!session) throw failure('conflict', 'Replacement is no longer pending.', 409);
         if (!body.cancel) {
+          await operatorAction(client, doc, 'replacement', session.replacement_target);
           uuid(body.candidateId);
           const candidate = (
             await client.query(
@@ -964,7 +1094,8 @@ export function batchOperations(
         ).rows[0];
         ownership(user, batch, true);
         mutable(batch, true);
-        await operatorEdit(client, user, batch);
+        const doc = await operatorEdit(client, user, batch);
+        await operatorAction(client, doc, 'reorder', body.pageId);
         version(batch, body.version);
         await noRunning(client, id);
         const ids = (

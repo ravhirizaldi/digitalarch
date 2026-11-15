@@ -39,7 +39,7 @@ Batch→document→review locks, a required document version, a unique decision 
 
 Each approved L1/L2 decision has a stable confirmation UUID and retained officer name. A QR encodes the authenticated `/confirmations/:id` route; it is a lookup reference, never an approval token or public link. The receipt identifies cycle/revision, officer/time, final-versus-pending status and whether the confirmation is historical. Returning/dropping does not invalidate the historical record or let it count as current publication.
 
-The assigned operator receives persistent, dismissible notices with **View / print QR**. Dismissal only records the user's notification read; receipts remain in document history. **Print QR** prints the receipt without workspace navigation and waits for the QR image to load. QR generation uses the local application origin. A localhost URL on a phone refers to the phone, not this workstation; remote verification is not implemented.
+The operator receives persistent shared-navbar inbox events with QR actions and personal read/unread/view state. Final publication also informs involved QC/earlier confirming officers; intermediate L1 remains pending L2. Receipts offer **Download QR** (PNG) and **Print QR**, waiting for image load before printing without navigation. See [NOTIFICATIONS.md](NOTIFICATIONS.md). QR URLs use the local application origin. A localhost URL on a phone refers to the phone, not this workstation; remote verification is not implemented.
 
 ## API and migration handoff
 
@@ -49,9 +49,9 @@ The assigned operator receives persistent, dismissible notices with **View / pri
 - `GET /api/records/:batchId/pages/:pageId/{thumbnail|preview|image|text}`: independently authorized content.
 - `POST /api/records/:batchId/decision`: version and `action=approve|return|drop|assign-l2|take-down`; reason and target as required. Takedown uses `target=qc|l1` and a `reviewerId` for QC.
 - `GET /api/confirmations/:id` and `/qr`: authenticated receipt and generated SVG.
-- `GET /api/approval-notifications`; `POST /api/confirmations/:id/dismiss`: operator notification state.
+- `GET /api/notifications`, `/summary`, `/stream` and per-recipient POST read/view actions: shared staff inbox; old approval-notification/dismiss routes remain compatibility-only and are not polled by the current frontend.
 
-Apply migrations through 018 before updated backend code. Tests are written in `test/approval.test.mjs` and `test/routes.test.mjs`, not executed. No new capture/OCR lifecycle, bulk-library export, AI search or remote server is included. The separately implemented approved Viewer and image-only PDF workflow is documented in [VIEWER.md](VIEWER.md).
+Apply migrations through 019 before updated backend code. Tests are written in `test/approval.test.mjs`, `test/notifications.test.mjs` and `test/routes.test.mjs`, not executed. No new capture/OCR lifecycle, bulk-library export, AI search or remote server is included. The separately implemented Viewer workflow is documented in [VIEWER.md](VIEWER.md).
 
 ---
 
