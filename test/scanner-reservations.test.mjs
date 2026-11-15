@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 import { createService } from '../server.mjs';
@@ -58,6 +58,17 @@ async function until(check) {
   }
   throw new Error('Capture did not settle');
 }
+
+test('malformed recovery markers fail closed instead of making an unresolved device available', async (t) => {
+  const dataDir = await mkdtemp('/tmp/opencode/digitalarch-fleet-invalid-');
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  await mkdir(path.join(dataDir, 'scanner-active'));
+  await writeFile(
+    path.join(dataDir, 'scanner-active', 'invalid.json'),
+    JSON.stringify({ key: 'Wia:a' }),
+  );
+  await assert.rejects(createService({ dataDir }), { code: 'invalid_recovery_marker' });
+});
 
 test('operator selections, capture cancellation and FIFO queues are independent across devices', async (t) => {
   const dataDir = await mkdtemp('/tmp/opencode/digitalarch-fleet-');

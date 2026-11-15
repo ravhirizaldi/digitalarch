@@ -78,6 +78,17 @@ export default function ScannerSettings({
               size="small"
               title="Selected profile"
               items={[
+                {
+                  key: 'reservation',
+                  label: 'Reservation',
+                  children: scanner.reservation?.recoveryRequired
+                    ? 'Administrator recovery required'
+                    : scanner.reservation?.held
+                      ? 'Reserved for you'
+                      : scanner.reservation?.position != null
+                        ? `Queue position ${scanner.reservation.position}`
+                        : 'Not reserved',
+                },
                 { key: 'profile', label: 'Name', children: profile?.name || 'Not selected' },
                 {
                   key: 'source',
@@ -125,7 +136,7 @@ export default function ScannerSettings({
               type="info"
               showIcon
               title="Detection is not physical readiness"
-              description="Profiles and devices refresh automatically about every 30 seconds while Real Hardware is open, and are checked again before scanning. Discovery does not prove paper or mechanical readiness. Use Refresh after clearing a jam."
+              description="Discovery refreshes about every 30 seconds when idle. Capability checks run only during reserved capture. Discovery does not prove paper or mechanical readiness. Use Refresh after clearing a jam."
             />
             <Collapse
               size="small"

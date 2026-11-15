@@ -48,7 +48,7 @@ export function enterprise({
         if (!acquired)
           throw failure(
             'runtime_busy',
-            'Another DigitalArch process is using this database. Run only one backend per scanner.',
+            'Another DigitalArch process is using this database. Run only one backend per capture host/database.',
             503,
           );
         await connection.query('SELECT id FROM archive_batches LIMIT 1');
@@ -174,6 +174,7 @@ export function enterprise({
           );
         if (pathname === '/api/auth/logout' && method === 'POST') {
           keys(body, []);
+          await scanner.releaseUser(user.id);
           return await auth.logout(context, res);
         }
         if (pathname === '/api/auth/change-password' && method === 'POST')

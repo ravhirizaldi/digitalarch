@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { failure } from '../errors.mjs';
@@ -21,6 +21,18 @@ export async function scannerFleet({ base, createReal, dataDir }) {
   for (const name of await readdir(directory)) {
     if (!name.endsWith('.json')) continue;
     const saved = JSON.parse(await readFile(path.join(directory, name), 'utf8'));
+    if (
+      !saved ||
+      typeof saved.key !== 'string' ||
+      !saved.key.startsWith('Wia:') ||
+      typeof saved.jobId !== 'string' ||
+      !saved.jobId
+    )
+      throw failure(
+        'invalid_recovery_marker',
+        'Invalid scanner recovery marker. Verify stopped Windows helpers and recover the marker before starting DigitalArch.',
+        500,
+      );
     reservations.restore(saved.key, saved.jobId);
   }
   const marker = (key) => `${createHash('sha256').update(key).digest('hex')}.json`;
@@ -44,7 +56,9 @@ export async function scannerFleet({ base, createReal, dataDir }) {
             return {
               ...selected,
               reservation,
-              canScan: selected.canScan && (!key || (reservation.held && !reservation.active)),
+              canScan:
+                selected.canScan &&
+                (!key || (key === keyFor(selected) && reservation.held && !reservation.active)),
               devices: selected.devices?.map((device) => ({
                 ...device,
                 reservation: reservations.status(`Wia:${device.id}`, owner),
@@ -73,34 +87,16 @@ export async function scannerFleet({ base, createReal, dataDir }) {
               );
             reservedKey = null;
           }
-          function inspectable(selection = {}) {
-            const selected = local.status();
-            if (selected.mode !== 'real') return;
-            const deviceId = selection.deviceId ?? selected.device?.id;
-            const entries = deviceId ? [{ id: deviceId }] : selected.devices || [];
-            if (entries.some((device) => reservations.status(`Wia:${device.id}`, owner).active))
-              throw failure(
-                'busy',
-                'Scanner capture is active. Discovery will retry after capture finishes.',
-                409,
-              );
-          }
           const api = {
             status,
             refreshIfNeeded() {
               reservations.heartbeat(owner);
-              try {
-                inspectable();
-                local.refreshIfNeeded();
-              } catch (error) {
-                if (error.code !== 'busy') throw error;
-              }
+              local.refreshIfNeeded();
               return status();
             },
             refresh(selection = {}) {
               return exclusive(async () => {
                 if (Object.keys(selection).length) selectionIdle();
-                inspectable(selection);
                 await local.refresh(selection);
                 return status();
               });
@@ -108,7 +104,6 @@ export async function scannerFleet({ base, createReal, dataDir }) {
             setMode(value) {
               return exclusive(async () => {
                 selectionIdle();
-                inspectable();
                 await local.setMode(value);
                 return status();
               });
@@ -131,7 +126,7 @@ export async function scannerFleet({ base, createReal, dataDir }) {
                 return status();
               });
             },
-            start(options, beforeStart, sessionId) {
+            start(options = {}, beforeStart = async () => {}, sessionId = randomUUID()) {
               return exclusive(async () => {
                 const key = keyFor(local.status());
                 if (local.status().mode === 'real' && !key)
@@ -178,6 +173,10 @@ export async function scannerFleet({ base, createReal, dataDir }) {
   }
   return {
     forUser: scope,
+    async releaseUser(owner) {
+      const selected = operators.get(owner);
+      if (selected) await (await selected).release();
+    },
     captureStatus(id) {
       return (jobs.get(id)?.local || fallback).captureStatus(id);
     },

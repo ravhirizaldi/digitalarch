@@ -61,6 +61,8 @@ export default function ScannerWorkspace({
   const hasRemoved = state.pageDetails.some((page) => page.excluded);
   const undoPage = state.pageDetails.find((page) => page.id === lastRemoved && page.excluded);
   const simulator = scanner.mode === 'simulator';
+  const reservation = scanner.reservation;
+  const reserved = reservation?.position != null;
   const pages = state.pageDetails.filter(
     (page) =>
       (showRemoved || !page.excluded) && (sessionKey === 'all' || page.sessionId === sessionKey),
@@ -90,7 +92,13 @@ export default function ScannerWorkspace({
     (simulator && (!Number.isInteger(pageDelay) || pageDelay < 0 || pageDelay > 10000));
   const feedback =
     networkError ||
-    (!locked && (state.error || (!scanner.canScan && !busy ? scanner.message : null)));
+    (!locked &&
+      (state.error ||
+        (!scanner.canScan &&
+        !busy &&
+        (!reservation || !['device_detected', 'capabilities_verified'].includes(scanner.state))
+          ? scanner.message
+          : null)));
   async function restorePage(target) {
     if (await onPageAction(target, 'restore')) {
       setLastRemoved(null);
@@ -277,7 +285,7 @@ export default function ScannerWorkspace({
           <Segmented
             aria-label="Scanner Mode"
             value={requestedMode || scanner.mode || 'simulator'}
-            disabled={busy}
+            disabled={busy || reserved}
             onChange={(mode) => onAction('mode', { mode })}
             options={[
               { label: 'Simulator', value: 'simulator' },
@@ -302,13 +310,13 @@ export default function ScannerWorkspace({
                 prefix="Device"
                 className="scanner-select"
                 value={scanner.selectedDeviceId || ''}
-                disabled={busy || !scanner.devices?.length}
+                disabled={busy || reserved || !scanner.devices?.length}
                 onChange={(deviceId) => onAction('refresh', { deviceId: deviceId || null })}
                 options={[
                   { value: '', label: 'Automatic · Match selected profile' },
                   ...(scanner.devices || []).map((item) => ({
                     value: item.id,
-                    label: `${item.name}${scanner.devices.filter((device) => device.name === item.name).length > 1 ? ` · ${item.id}` : ''}`,
+                    label: `${item.name}${scanner.devices.filter((device) => device.name === item.name).length > 1 ? ` · ${item.id}` : ''} · ${item.reservation?.recoveryRequired ? 'Recovery required' : item.reservation?.active ? 'Capturing' : item.reservation?.held ? 'Reserved by you' : item.reservation?.occupied ? 'Reserved' : 'Available'}`,
                   })),
                 ]}
               />
@@ -317,7 +325,7 @@ export default function ScannerWorkspace({
                 prefix="Profile"
                 className="scanner-select"
                 value={scanner.profileId}
-                disabled={busy || !scanner.profiles?.length}
+                disabled={busy || reserved || !scanner.profiles?.length}
                 onChange={(profileId) => onAction('refresh', { profileId, deviceId: null })}
                 options={scanner.profiles?.map((item) => ({
                   value: item.id,
@@ -374,6 +382,42 @@ export default function ScannerWorkspace({
             ]}
           />
         </div>
+      )}
+      {!locked && !simulator && (
+        <Alert
+          type={reservation?.recoveryRequired ? 'error' : reservation?.held ? 'success' : 'info'}
+          showIcon
+          title={
+            reservation?.recoveryRequired
+              ? 'Scanner locked for administrator recovery'
+              : reservation?.held
+                ? `Scanner reserved for you · ${reservation.waiting} waiting`
+                : reserved
+                  ? `Waiting for scanner · queue position ${reservation.position}`
+                  : 'Reserve a scanner before loading paper'
+          }
+          description={
+            reservation?.recoveryRequired
+              ? 'A previous capture did not release safely. An administrator must verify the Windows helper and device have stopped.'
+              : reservation?.held
+                ? 'Load your document, then choose Scan feeder. Release the scanner when finished.'
+                : reserved
+                  ? 'Your turn updates automatically. Scanning never starts automatically.'
+                  : 'Reservations and queue positions expire after two minutes without scanner-status updates.'
+          }
+          action={
+            <Button
+              onClick={() => onAction(reserved ? 'release' : 'reserve')}
+              disabled={busy || (!reserved && (!scanner.device || reservation?.recoveryRequired))}
+            >
+              {reserved
+                ? reservation.held
+                  ? 'Release scanner'
+                  : 'Leave queue'
+                : 'Reserve / join queue'}
+            </Button>
+          }
+        />
       )}
       {((!locked && requestedMode) || feedback) && (
         <div className="feedback" role="status" aria-live="polite">

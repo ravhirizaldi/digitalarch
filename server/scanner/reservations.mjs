@@ -15,6 +15,7 @@ export function scannerReservations({ now = Date.now, leaseMs = 120000 } = {}) {
       const entries = queue(key);
       const position = entries.findIndex((entry) => entry.owner === owner);
       return {
+        occupied: entries.length > 0,
         position: position < 0 ? null : position,
         held: position === 0,
         waiting: entries.length - (entries.length ? 1 : 0),
