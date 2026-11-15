@@ -12,7 +12,7 @@
     "dev": "node --watch scripts/dev.mjs",
     "build": "vite build",
     "lint": "eslint src server scripts test server.mjs bridge.mjs",
-    "format:check": "prettier --check src server scripts test/*.mjs server.mjs bridge.mjs eslint.config.mjs package.json compose.yaml README.md SETUP.md PRODUCT.md DESIGN.md DATABASE.md ENGINEERING_REPORT.md OCR.md QC.md DND.md ERD.md DFD.md APPROVAL.md",
+    "format:check": "prettier --check src server scripts test/*.mjs server.mjs bridge.mjs eslint.config.mjs package.json compose.yaml README.md SETUP.md PRODUCT.md DESIGN.md DATABASE.md ENGINEERING_REPORT.md OCR.md QC.md DND.md ERD.md DFD.md APPROVAL.md VIEWER.md",
     "start": "node server.mjs",
     "test": "node --test --test-concurrency=2 test/*.test.mjs",
     "test:profiles": "dotnet run --project test/ProfileChecks/ProfileChecks.csproj",
@@ -28,7 +28,9 @@
     "@ant-design/icons": "6.3.4",
     "@node-rs/argon2": "^2.2.2",
     "antd": "6.7.0",
+    "pdfkit": "0.20.2",
     "pg": "^8.23.1",
+    "qrcode": "^1.5.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "sharp": "^0.35.5"

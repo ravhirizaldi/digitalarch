@@ -6,6 +6,9 @@ import { captureStorage } from './capture-storage.mjs';
 import { failure } from './errors.mjs';
 import { ocrProcessing } from './ocr.mjs';
 import { qualityControl } from './qc.mjs';
+import { approvals } from './approvals.mjs';
+import { viewerWorkspace } from './viewer.mjs';
+import { isViewer, viewerAudit } from './viewer-audit.mjs';
 
 export function enterprise({
   scanner,
@@ -24,6 +27,8 @@ export function enterprise({
   let closed = false;
   const ocr = ocrProcessing(pool, storage, { ...ocrOptions, allowed: () => !!lock && !closed });
   const qc = qualityControl(pool, storage);
+  const approval = approvals(pool, storage);
+  const viewer = viewerWorkspace(pool, storage, auth, dataDir);
   const batches = batchOperations(pool, scanner, storage, {
     ocrLanguage: null,
     ocrConfig: null,
@@ -53,6 +58,7 @@ export function enterprise({
           connection.release(true);
         });
         await ocr.initializeDefaults();
+        await viewer.initialize();
         await batches.recover();
         ocr.start();
       } catch (error) {
@@ -87,6 +93,8 @@ export function enterprise({
     storage,
     ocr,
     qc,
+    approval,
+    viewer,
     ready: ensure,
     async start() {
       try {
@@ -102,6 +110,7 @@ export function enterprise({
         try {
           await ensure();
           await batches.sweep();
+          await viewer.sweep();
           await qc.refresh();
         } catch {
           /* Retry without deleting spool or managed originals. */
@@ -116,6 +125,7 @@ export function enterprise({
       clearInterval(timer);
       await ocr.close();
       while (sweeping) await new Promise((resolve) => setTimeout(resolve, 10));
+      await viewer.close();
       await storage.close();
       // Close only after any final page transaction releases its client.
       if (lock) {
@@ -130,14 +140,18 @@ export function enterprise({
       await pool.end();
     },
     async route(req, res, url, body) {
+      let routeUser;
       try {
         await ensure();
         const pathname = url.pathname;
         const method = req.method === 'HEAD' ? 'GET' : req.method;
         if (pathname === '/api/auth/login' && method === 'POST')
           return await auth.login(body, res, req.correlationId);
+        if (pathname === '/api/auth/register' && method === 'POST')
+          return await viewer.register(body, req.correlationId);
         const context = await auth.authenticate(req);
         const user = { ...context.user, correlationId: req.correlationId };
+        routeUser = user;
         context.user = user;
         if (method !== 'GET') auth.csrf(req, context.session);
         if (pathname === '/api/auth/me' && method === 'GET')
@@ -155,6 +169,99 @@ export function enterprise({
             403,
           );
         const permit = (permission) => requirePermission(user, permission);
+        if (pathname === '/api/admin/viewer-registrations' && method === 'GET')
+          return await viewer.registrations(user, url.searchParams.get('status') || 'pending');
+        const registration = pathname.match(/^\/api\/admin\/viewer-registrations\/([^/]+)$/);
+        if (registration && method === 'POST')
+          return await viewer.decideRegistration(user, registration[1], body);
+        if (pathname === '/api/viewer/documents' && method === 'GET')
+          return await viewer.list(user, {
+            ...Object.fromEntries(
+              ['search', 'type', 'sort', 'direction']
+                .filter((key) => url.searchParams.has(key))
+                .map((key) => [key, url.searchParams.get(key)]),
+            ),
+            limit: numeric(url.searchParams.get('limit'), 25, 100),
+            offset: numeric(url.searchParams.get('offset'), 0, 1_000_000),
+          });
+        if (pathname === '/api/viewer/activity' && method === 'POST')
+          return await viewer.activity(user, body);
+        const viewerDocument = pathname.match(
+          /^\/api\/viewer\/documents\/([^/]+)(?:\/(downloads))?$/,
+        );
+        if (viewerDocument) {
+          if (method === 'GET' && !viewerDocument[2])
+            return await viewer.get(user, viewerDocument[1]);
+          if (method === 'POST' && viewerDocument[2])
+            return await viewer.download(user, viewerDocument[1], body);
+        }
+        const viewerPage = pathname.match(
+          /^\/api\/viewer\/documents\/([^/]+)\/pages\/([^/]+)\/(image|preview|thumbnail)$/,
+        );
+        if (viewerPage && method === 'GET') return await viewer.page(user, ...viewerPage.slice(1));
+        const viewerDownload = pathname.match(/^\/api\/viewer\/downloads\/([^/]+)$/);
+        if (viewerDownload && method === 'GET') {
+          return await viewer.downloadStatus(user, viewerDownload[1]);
+        }
+        const viewerTransfer = pathname.match(/^\/api\/viewer\/downloads\/([^/]+)\/transfer$/);
+        if (viewerTransfer && method === 'POST') {
+          keys(body, []);
+          return await viewer.downloadStatus(user, viewerTransfer[1], true);
+        }
+        const viewerReport = pathname.match(/^\/api\/viewer\/downloads\/([^/]+)\/report$/);
+        if (viewerReport && method === 'POST')
+          return await viewer.reportDownload(user, viewerReport[1], body);
+        if (pathname === '/api/settings/approval') {
+          if (method === 'GET') return await approval.settings(user);
+          if (method === 'PATCH') return await approval.updateSettings(user, body);
+        }
+        if (pathname === '/api/records' && method === 'GET')
+          return await approval.list(user, {
+            ...Object.fromEntries(
+              [
+                'view',
+                'search',
+                'status',
+                'type',
+                'number',
+                'location',
+                'operator',
+                'reviewer',
+                'authority',
+                'from',
+                'to',
+                'ocr',
+                'metadata',
+                'sort',
+                'direction',
+              ]
+                .filter((key) => url.searchParams.has(key))
+                .map((key) => [key, url.searchParams.get(key)]),
+            ),
+            limit: numeric(url.searchParams.get('limit'), 25, 100),
+            offset: numeric(url.searchParams.get('offset'), 0, 1_000_000),
+          });
+        if (pathname === '/api/approval-notifications' && method === 'GET')
+          return await approval.notifications(user);
+        const confirmation = pathname.match(/^\/api\/confirmations\/([^/]+)(?:\/(qr|dismiss))?$/);
+        if (confirmation) {
+          if (method === 'GET' && !confirmation[2])
+            return await approval.confirmation(user, confirmation[1]);
+          if (method === 'GET' && confirmation[2] === 'qr')
+            return await approval.qr(user, confirmation[1], url.origin);
+          if (method === 'POST' && confirmation[2] === 'dismiss')
+            return await approval.dismiss(user, confirmation[1], body);
+        }
+        const record = pathname.match(/^\/api\/records\/([^/]+)(?:\/(decision))?$/);
+        if (record) {
+          if (method === 'GET' && !record[2]) return await approval.get(user, record[1]);
+          if (method === 'POST' && record[2]) return await approval.decide(user, record[1], body);
+        }
+        const recordPage = pathname.match(
+          /^\/api\/records\/([^/]+)\/pages\/([^/]+)\/(preview|thumbnail|image|text)$/,
+        );
+        if (recordPage && method === 'GET')
+          return await approval.page(user, ...recordPage.slice(1));
         if (pathname === '/api/qc/queue' && method === 'GET')
           return await qc.queue(user, {
             filter: url.searchParams.get('filter') || 'waiting',
@@ -269,6 +376,10 @@ export function enterprise({
             return await admin.create(user, body);
           }
         }
+        if (pathname === '/api/admin/users/bulk' && method === 'POST') {
+          permit(body?.action === 'delete' ? 'users:delete' : 'users:update');
+          return await admin.bulk(user, body);
+        }
         const account = pathname.match(/^\/api\/admin\/users\/([^/]+)(\/reset-password)?$/);
         if (account) {
           uuid(account[1]);
@@ -280,8 +391,7 @@ export function enterprise({
           }
           if (method === 'POST' && account[2]) {
             permit('users:update');
-            keys(body, []);
-            return await admin.reset(user, account[1]);
+            return await admin.reset(user, account[1], body);
           }
         }
         if (pathname === '/api/admin/audit-logs' && method === 'GET') {
@@ -289,6 +399,10 @@ export function enterprise({
           return await admin.logs(
             numeric(url.searchParams.get('limit'), 100, 200),
             numeric(url.searchParams.get('offset'), 0, 1_000_000),
+            {
+              category: url.searchParams.get('category') || 'all',
+              search: url.searchParams.get('search') || '',
+            },
           );
         }
         if (pathname === '/api/admin/system' && method === 'GET') {
@@ -438,6 +552,10 @@ export function enterprise({
         }
         throw failure('not_found', 'Operation not found.', 404);
       } catch (error) {
+        if (isViewer(routeUser) && [403, 404].includes(error.statusCode))
+          await viewerAudit(pool, 'access', routeUser, 'access_denied', {
+            metadata: { path: url.pathname.slice(0, 256), method: req.method, code: error.code },
+          });
         throw databaseError(error);
       }
     },

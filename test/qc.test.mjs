@@ -536,6 +536,69 @@ test('QC: scan-only operators may send terminal OCR warnings without filling met
   assert.equal((await detail(qc, id)).metadata.fields[0].value, 'Filled by QC');
 });
 
+test('QC: sampling marks all included pages across sessions without clearing correction flags', async (t) => {
+  const mock = mockOcr();
+  const f = await testApplication(t, { ocr: { provider: mock.provider } });
+  const op = await f.account(),
+    qc = await f.account(['qc_officer']),
+    other = await f.account(['qc_officer']);
+  let batch = good(await op.request('/api/batches', {})).batch;
+  batch = (await scanned(op, batch, { scenario: 'multi', pageDelay: 0 })).batch;
+  batch = (await scanned(op, batch, { scenario: 'single', pageDelay: 0 })).batch;
+  good(await op.request(`/api/batches/${batch.id}/complete-capture`, { version: batch.version }));
+  await drain(f);
+  await send(op, batch.id);
+  const bulk = { all: true, status: 'reviewed' };
+  assert.equal((await mutate(qc, batch.id, 'page-review', bulk)).status, 409);
+  good(await mutate(qc, batch.id, 'claim'));
+  const before = await detail(qc, batch.id);
+  const flagged = before.pages[0],
+    excluded = before.pages[1];
+  good(await mutate(qc, batch.id, 'page-edit', { pageId: excluded.id, action: 'exclude' }));
+  good(
+    await mutate(qc, batch.id, 'page-review', {
+      pageIds: [flagged.id],
+      status: 'needs_correction',
+    }),
+  );
+  assert.equal((await mutate(other, batch.id, 'page-review', bulk)).status, 409);
+  assert.equal(
+    (await mutate(qc, batch.id, 'page-review', { ...bulk, version: before.document.version }))
+      .status,
+    409,
+  );
+  for (const invalid of [
+    { ...bulk, all: 'true' },
+    { ...bulk, pageIds: [flagged.id] },
+    { all: true, status: 'needs_correction' },
+  ])
+    assert.equal((await mutate(qc, batch.id, 'page-review', invalid)).status, 400);
+  good(await mutate(qc, batch.id, 'page-review', bulk));
+  const after = await detail(qc, batch.id);
+  const reviewed = after.pages.filter((p) => p.id !== flagged.id && p.id !== excluded.id);
+  assert.ok(new Set(reviewed.map((p) => p.scan_session_id)).size > 1);
+  for (const page of reviewed) {
+    assert.equal(page.review_status, 'reviewed');
+    assert.equal(page.reviewed_image_revision, page.image_revision);
+  }
+  assert.equal(after.pages.find((p) => p.id === flagged.id).review_status, 'needs_correction');
+  assert.equal(after.pages.find((p) => p.id === excluded.id).review_status, null);
+  assert.equal(after.document.workflow_status, 'qc_in_review');
+  const event = (
+    await f.pool.query(
+      "SELECT metadata FROM audit_logs WHERE batch_id=$1 AND action='page.reviewed' AND metadata->>'reviewMethod'='sampling'",
+      [batch.id],
+    )
+  ).rows[0].metadata;
+  assert.equal(event.explicitBulk, true);
+  assert.deepEqual(event.pageIds.sort(), reviewed.map((p) => p.id).sort());
+  good(await mutate(qc, batch.id, 'page-review', { pageIds: [flagged.id], status: 'reviewed' }));
+  assert.equal(
+    (await detail(qc, batch.id)).pages.find((p) => p.id === flagged.id).review_status,
+    'reviewed',
+  );
+});
+
 test('QC: stale claim recovery, release, self-QC, CSRF, current text corrections and non-destructive page edits', async (t) => {
   const mock = mockOcr();
   const f = await testApplication(t, { ocr: { provider: mock.provider } });

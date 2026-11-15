@@ -12,17 +12,8 @@ export async function startDevelopment({ service, port = 3000 } = {}) {
   const target = `http://127.0.0.1:${backend.address().port}`;
   const proxy = {
     target,
-    changeOrigin: true,
-    configure(server) {
-      server.on('proxyReq', (outgoing, incoming) => {
-        // Translate only genuine same-origin dev requests; foreign origins stay rejected.
-        if (
-          /^(localhost|127\.0\.0\.1):\d+$/.test(incoming.headers.host || '') &&
-          incoming.headers.origin === `http://${incoming.headers.host}`
-        )
-          outgoing.setHeader('Origin', target);
-      });
-    },
+    // Preserve the validated browser Host/Origin for CSRF checks and QR links.
+    changeOrigin: false,
   };
   let frontend;
   try {

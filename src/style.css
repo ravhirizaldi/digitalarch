@@ -156,6 +156,10 @@ ul {
   border-bottom: 1px solid #d8dee7;
   overflow: hidden;
 }
+.workspace-nav .ant-menu.ant-menu-horizontal > .ant-menu-item::after,
+.workspace-nav .ant-menu.ant-menu-horizontal > .ant-menu-submenu::after {
+  inset-inline: 0;
+}
 .app-workspace {
   display: flex;
   flex: 1;
@@ -786,28 +790,122 @@ ul {
 .auth-screen {
   height: 100%;
   display: grid;
-  place-items: center;
-  overflow: auto;
-  padding: 24px;
-  background: #edf1f6;
+  grid-template-columns: minmax(300px, 46%) minmax(380px, 1fr);
+  overflow: hidden;
+  background: #fff;
+}
+.auth-introduction {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 40px;
+  padding: clamp(28px, 5vw, 72px);
+  color: #e8eef6;
+  background: #182d46;
+}
+.auth-introduction-copy {
+  max-width: 380px;
+}
+.auth-introduction h2 {
+  margin: 20px 0 16px;
+  font-size: clamp(26px, 3vw, 40px);
+  font-weight: 500;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+.auth-introduction-copy p {
+  color: #c5d2e2;
+  font-size: 15px;
+  line-height: 1.7;
+}
+.auth-document-icon {
+  font-size: 36px;
+}
+.auth-access-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #c5d2e2;
 }
 .auth-panel {
-  width: min(400px, 100%);
-  padding: 28px;
-  border: 1px solid #d8dee7;
-  border-radius: 4px;
-  background: #fff;
+  align-self: center;
+  justify-self: center;
+  width: min(460px, 100%);
+  padding: 36px;
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 .auth-brand {
-  color: #182d46;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   font-size: 20px;
   font-weight: 600;
 }
 .auth-panel h1 {
-  font-size: 16px;
+  font-size: 26px;
+  line-height: 1.25;
+}
+.auth-panel-register {
+  width: min(620px, 100%);
+}
+.auth-register-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+}
+.auth-register-form .ant-form-item {
+  margin-bottom: 16px;
+}
+.auth-register-form > .ant-btn {
+  grid-column: 1 / -1;
+}
+.auth-panel .ant-input,
+.auth-panel .ant-input-affix-wrapper,
+.auth-panel .ant-btn {
+  min-height: 36px;
+}
+.auth-panel .ant-input-affix-wrapper .ant-input {
+  min-height: auto;
+}
+.auth-switch {
+  padding-top: 8px;
+  border-top: 1px solid #e4e8ee;
+  color: #566376;
+}
+@media (max-width: 720px) {
+  .auth-screen {
+    display: block;
+  }
+  .auth-introduction {
+    padding: 24px;
+    gap: 20px;
+  }
+  .auth-introduction-copy,
+  .auth-access-note {
+    display: none;
+  }
+  .auth-panel {
+    margin: 0 auto;
+    padding: 28px 24px;
+  }
+}
+@media (max-height: 650px) {
+  .auth-panel {
+    gap: 10px;
+    padding-block: 16px;
+  }
+  .auth-panel h1 {
+    font-size: 22px;
+  }
+  .auth-panel .ant-form-item {
+    margin-bottom: 12px;
+  }
+  .auth-introduction {
+    gap: 16px;
+    padding-block: 20px;
+  }
 }
 .empty-workspace {
   display: grid;
@@ -833,6 +931,261 @@ ul {
 .temporary-password {
   overflow-wrap: anywhere;
   user-select: all;
+}
+.admin-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+}
+.admin-account-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+.admin-account-name strong,
+.admin-cell-secondary {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.admin-account-name strong,
+.admin-event-name {
+  font-weight: 500;
+}
+.admin-event-name {
+  text-transform: capitalize;
+  overflow-wrap: anywhere;
+}
+.admin-cell-secondary {
+  color: #566376;
+  font-size: 12px;
+}
+.admin-role-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.admin-role-tags .ant-tag,
+.admin-cell .ant-tag {
+  margin: 0;
+}
+.admin-modal-intro {
+  margin: 0 0 16px;
+  color: #566376;
+}
+.admin-user-modal .ant-alert {
+  margin-bottom: 12px;
+}
+.admin-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 0 16px;
+}
+.admin-user-modal .ant-form-item {
+  margin-bottom: 16px;
+}
+.admin-user-modal .ant-form-item-extra {
+  margin-top: 6px;
+  color: #566376;
+  font-size: 12px;
+}
+.admin-password-section {
+  padding-top: 16px;
+  border-top: 1px solid #d8dee7;
+}
+.admin-password-help {
+  margin: -4px 0 12px;
+  color: #566376;
+}
+.admin-security-note {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  color: #566376;
+  font-size: 12px;
+}
+.admin-detail-heading {
+  margin: 16px 0 8px;
+  font-size: 13px;
+}
+.admin-selected-count {
+  margin-right: 4px;
+  color: #566376;
+  font-variant-numeric: tabular-nums;
+}
+.admin-delete-names {
+  max-height: 120px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  color: #566376;
+}
+.admin-credentials + .admin-credentials {
+  margin-top: 12px;
+}
+.records-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+.records-filter-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #566376;
+  font-size: 12px;
+}
+.records-page-rail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.records-page-rail .panel-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid #d8dee7;
+}
+.records-page-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.records-page-list .ant-list-item {
+  padding: 0;
+}
+.records-page-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  border: 0;
+  color: #202c3b;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+}
+.records-page-button span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.records-page-button:hover {
+  background: #f3f5f8;
+}
+.records-page-button.is-selected {
+  background: #edf3fa;
+  color: #2463a6;
+}
+.records-page-button:focus-visible {
+  outline: 2px solid #2463a6;
+  outline-offset: -2px;
+}
+.records-page-rail .ant-pagination {
+  padding: 8px 4px;
+  border-top: 1px solid #d8dee7;
+}
+.records-metadata {
+  margin: 12px 0;
+}
+.records-metadata > div,
+.records-finding {
+  padding-block: 8px;
+  border-bottom: 1px solid #d8dee7;
+}
+.records-metadata dt {
+  color: #566376;
+  font-size: 12px;
+  text-transform: capitalize;
+}
+.records-metadata dd {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.records-reason,
+.records-ocr-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.records-ocr-text {
+  font: inherit;
+}
+.approval-settings-section {
+  margin-bottom: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #d8dee7;
+}
+.confirmation-workspace {
+  overflow: auto;
+}
+.confirmation-receipt {
+  width: min(100%, 580px);
+  margin: 8px auto 24px;
+  padding: 24px;
+  background: #fff;
+  border: 1px solid #d8dee7;
+  border-radius: 4px;
+}
+.confirmation-receipt h2 {
+  margin-top: 0;
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+.confirmation-qr {
+  display: block;
+  width: 240px;
+  height: 240px;
+  max-width: 100%;
+  margin: 16px auto;
+}
+.confirmation-note {
+  color: #566376;
+  font-size: 12px;
+}
+@media print {
+  body:has(.confirmation-receipt) {
+    background: #fff;
+  }
+  body:has(.confirmation-receipt) .app-header,
+  body:has(.confirmation-receipt) .workspace-nav,
+  body:has(.confirmation-receipt) .status-bar,
+  body:has(.confirmation-receipt) .no-print,
+  body:has(.confirmation-receipt) .ant-notification {
+    display: none !important;
+  }
+  body:has(.confirmation-receipt) .app-shell,
+  body:has(.confirmation-receipt) .ant-app-root,
+  body:has(.confirmation-receipt) .app-workspace,
+  body:has(.confirmation-receipt) .workspace {
+    display: block;
+    height: auto;
+    overflow: visible;
+  }
+  .confirmation-receipt {
+    margin: 0 auto;
+    padding: 12px;
+    border: 0;
+    break-inside: avoid;
+  }
+}
+.admin-event-metadata {
+  margin: 0;
+  padding: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  background: #f3f5f8;
+  border: 1px solid #d8dee7;
+  border-radius: 4px;
+  font-size: 12px;
 }
 .ant-modal-body {
   max-height: calc(100dvh - 200px);

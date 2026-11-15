@@ -21,6 +21,7 @@ export default function PageViewer({
   highlight = null,
   viewState,
   onViewChange,
+  allowDownload = true,
 }) {
   const viewport = useRef(null);
   const drag = useRef(null);
@@ -84,6 +85,7 @@ export default function PageViewer({
     highlight,
     viewState,
     onViewChange,
+    allowDownload,
   };
   return (
     <section className="page-viewer" aria-label={label || 'Document preview'}>
@@ -138,13 +140,15 @@ export default function PageViewer({
               onClick={() => setView({ fullscreen: true })}
             />
           )}
-          <IconButton
-            label="Download original PNG"
-            icon={<DownloadOutlined />}
-            disabled={!image}
-            href={originalSource}
-            download
-          />
+          {allowDownload && (
+            <IconButton
+              label="Download original PNG"
+              icon={<DownloadOutlined />}
+              disabled={!image}
+              href={originalSource}
+              download
+            />
+          )}
         </Space>
       </div>
       {error && (

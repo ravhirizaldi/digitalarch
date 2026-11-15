@@ -1,6 +1,6 @@
 # Entity relationship diagrams
 
-**As-built baseline: 2026-11-15, migrations 001–014.** These diagrams describe the local source schema, not a fresh inspection of a running database. Selected columns are shown; the SQL migrations remain authoritative. Approval decisions and the final archive viewer do not exist yet; their proposed model is in [APPROVAL.md](APPROVAL.md).
+**Source baseline: 2026-11-15, migrations 001–017.** These diagrams describe source, not a fresh inspection of a running database. Selected columns are shown; SQL migrations remain authoritative. Approval decisions and the approved-viewer library are implemented in source. See [APPROVAL.md](APPROVAL.md) and [VIEWER.md](VIEWER.md).
 
 ## 1. Accounts, roles and sessions
 
@@ -19,6 +19,8 @@ erDiagram
         TEXT password_hash
         BOOLEAN is_active
         BOOLEAN must_change_password
+        TIMESTAMPTZ deleted_at
+        TEXT viewer_registration_status
         INTEGER version
     }
     roles {
@@ -54,8 +56,9 @@ erDiagram
 ```
 
 - Username uniqueness is on `lower(username)`, not a case-sensitive column constraint.
+- Deleted users remain as disabled identities (`deleted_at` requires `is_active=false`). Usernames, ownership and audit references are retained; the Users list excludes deleted identities. Migration 015 grants System Administrator `users:delete` without adding document-batch deletion authority.
 - `auth_login_attempts.username` is deliberately not a user FK: unknown usernames must also be throttled.
-- Six roles are seeded, but L1/L2/Archive Viewer currently have permission scaffolding only. Role assignment prevents L1 + L2 and approval + Operator/QC combinations. Historical participation checks will still be needed for approval if an account changes roles later.
+- Six roles are seeded. L1/L2 have decision routes; Archive Viewer has a separate published-only library after administrator authorization. Pending/rejected registrations are inactive. Role assignment prevents L1 + L2 and approval + Operator/QC combinations. Historical operator/QC/approval participation is checked across later role changes.
 - Tokens and CSRF values are hashed in PostgreSQL. Raw session tokens are not stored in the frontend or these docs.
 
 ## 2. Capture, logical documents and image history
@@ -290,10 +293,84 @@ erDiagram
 - `documents.metadata_json.fields` is the authoritative current metadata. `document_metadata` is older per-run history. Neither field candidates nor source bounds are standalone SQL entities.
 - Unique `(document_id,version)` protects metadata revisions; unique `(document_id,cycle)` protects review cycles. Metadata revisions and OCR corrections have append-only triggers.
 - `UUID_ARRAY` above denotes PostgreSQL `UUID[]`. `qc_findings.page_ids` and `metadata_field_id` are application-validated references, not SQL FKs to pages or a nonexistent metadata-fields table.
-- QC snapshots contain ordered public page identities/checksums/revisions, metadata, findings, page-review records and specific OCR result/correction IDs. References inside JSON are not SQL FKs. Future approval/viewer reads must resolve those saved identities rather than silently select the latest text/image.
+- QC snapshots contain ordered public page identities/checksums/revisions, metadata, findings, page-review records and specific OCR result/correction IDs. References inside JSON are not SQL FKs. Approval reads resolve those saved identities rather than silently select the latest text/image.
 - Reviewer/creator/resolver user FKs exist even where an extra user edge is omitted to keep the diagram readable.
 
-## 4. Migration ledger and retention
+## 4. Approval policy, decisions and notification reads
+
+```mermaid
+erDiagram
+    documents ||--o{ qc_reviews : cycles
+    qc_reviews ||--o{ approval_decisions : decisions
+    documents ||--o{ publication_withdrawals : takedowns
+    qc_reviews ||--o| publication_withdrawals : withdrawn_review
+    qc_reviews ||--o| publication_withdrawals : resumed_review
+    users ||--o{ publication_withdrawals : withdraws
+    qc_reviews o|--o{ qc_reviews : carries_signed_pass
+    users ||--o{ approval_decisions : confirms
+    users ||--o{ approval_notification_reads : dismisses
+    approval_decisions ||--o{ approval_notification_reads : read_by
+    users o|--o{ approval_settings : edits
+    approval_settings {
+        BOOLEAN singleton PK
+        BOOLEAN l2_required
+        TEXT l1_label
+        TEXT l2_label
+        INTEGER version
+        UUID updated_by FK
+    }
+    documents {
+        UUID id PK
+        BOOLEAN approval_l2_required
+        INTEGER approval_policy_version
+        UUID assigned_l2_id FK
+        UUID published_by FK
+        TIMESTAMPTZ published_at
+    }
+    qc_reviews {
+        UUID id PK
+        UUID document_id FK
+        UUID assigned_reviewer_id FK
+        UUID carried_from_review_id FK
+        TEXT approval_return_reason
+    }
+    approval_decisions {
+        UUID id PK
+        UUID qc_review_id FK
+        INTEGER level
+        TEXT decision
+        UUID decided_by FK
+        TEXT officer_name
+        TEXT reason
+        UUID nominated_l2_id FK
+        UUID returned_to FK
+        TIMESTAMPTZ decided_at
+    }
+    approval_notification_reads {
+        UUID user_id PK, FK
+        UUID decision_id PK, FK
+        TIMESTAMPTZ dismissed_at
+    }
+    publication_withdrawals {
+        UUID id PK
+        UUID document_id FK
+        UUID qc_review_id FK, UK
+        UUID resumed_review_id FK, UK
+        INTEGER revision
+        TIMESTAMPTZ prior_published_at
+        TEXT target
+        TEXT reason
+        UUID taken_by FK
+        TEXT officer_name
+        TIMESTAMPTZ taken_at
+    }
+```
+
+Policy is fixed at first QC Pass; its integer version is a historical value, not a foreign key to the singleton's changing version. Decisions are append-only and unique on `(qc_review_id,level)`. Reasons are mandatory for returns/drops. QR images are generated from the decision ID; they are not stored document copies or access tokens. Dismissing a notice does not delete its decision.
+
+Migration 018 adds append-only publication takedowns with required reasons and unique source/resumed reviews. A QC destination creates an undecided review; an L1 destination carries the signed QC result via `carried_from_review_id` into a new cycle without copying old approval decisions. Publication fields clear in the same transaction. No files or original history are deleted.
+
+## 5. Migration ledger and retention
 
 `schema_migrations(name TEXT PRIMARY KEY, sha256 TEXT, applied_at TIMESTAMPTZ)` is maintained by `server/db.mjs`; it has no domain FK. Applied SQL files are checksummed and must never be edited in place.
 

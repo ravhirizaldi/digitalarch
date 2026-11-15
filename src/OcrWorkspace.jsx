@@ -405,9 +405,15 @@ function OcrJobDetail({
   const nextConfig = defaults?.processing_config;
   const canManage =
     job &&
-    !['preparing', 'qc_waiting', 'qc_in_review', 'awaiting_approval_l1'].includes(
-      job.workflow_status,
-    ) &&
+    ![
+      'preparing',
+      'qc_waiting',
+      'qc_in_review',
+      'awaiting_approval_l1',
+      'awaiting_approval_l2',
+      'approved',
+      'dropped',
+    ].includes(job.workflow_status) &&
     user.permissions.includes('ocr:manage') &&
     (job.assigned_operator_id === user.id || user.permissions.includes('ocr:manage_all'));
   async function control(action) {

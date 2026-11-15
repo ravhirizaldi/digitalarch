@@ -37,6 +37,7 @@ import ScannerSettings from './ScannerSettings';
 import ScannerWorkspace from './ScannerWorkspace';
 import AuthScreen from './AuthScreen';
 import BatchList from './BatchList';
+import { ApprovalNotifications } from './ApprovalConfirmation';
 import './style.css';
 
 const Administration = lazy(() => import('./Administration'));
@@ -44,6 +45,11 @@ const OcrWorkspace = lazy(() => import('./OcrWorkspace'));
 const OcrSettings = lazy(() => import('./OcrSettings'));
 const QcWorkspace = lazy(() => import('./QcWorkspace'));
 const QcQueue = lazy(() => import('./QcWorkspace').then((module) => ({ default: module.QcQueue })));
+const Documents = lazy(() => import('./Documents'));
+const ApprovalDocument = lazy(() => import('./ApprovalDocument'));
+const ApprovalConfirmation = lazy(() => import('./ApprovalConfirmation'));
+const ViewerWorkspace = lazy(() => import('./ViewerWorkspace'));
+const ViewerRegistrations = lazy(() => import('./ViewerRegistrations'));
 
 function DigitalArchApp() {
   const [identity, setIdentity] = useState(null);
@@ -90,7 +96,7 @@ function DigitalArchApp() {
   }, []);
   const showView = useCallback((next, batchId = null, replace = false) => {
     if (next === 'ocr') setOcrJobId(batchId);
-    if (next === 'document') setDocumentBatchId(batchId);
+    if (['document', 'record', 'confirmation'].includes(next)) setDocumentBatchId(batchId);
     const destination = new URL(routePath(next, batchId), window.location.origin);
     if (
       destination.pathname === window.location.pathname ||
@@ -100,6 +106,8 @@ function DigitalArchApp() {
     else if (
       (next === 'document' &&
         ['/qc', '/batches', '/capture', '/admin/batches'].includes(window.location.pathname)) ||
+      (next === 'record' && ['/documents', '/approvals'].includes(window.location.pathname)) ||
+      (next === 'confirmation' && window.location.pathname.startsWith('/records/')) ||
       (next === 'ocr' && batchId && window.location.pathname === '/ocr')
     )
       destination.searchParams.set('returnTo', window.location.pathname + window.location.search);
@@ -151,7 +159,11 @@ function DigitalArchApp() {
           showView('scanner', result.batch.id, true);
         } else {
           clearBatch();
-          showView(route.view, route.jobId || route.documentBatchId || null, true);
+          showView(
+            route.view,
+            route.jobId || route.documentBatchId || route.recordId || route.confirmationId || null,
+            true,
+          );
         }
       } catch (error) {
         setError(error.message);
@@ -299,13 +311,13 @@ function DigitalArchApp() {
       showView(next, nextId);
     });
   }
-  function navigate(next) {
+  function navigate(next, nextId = null) {
     if (busy) return;
     if (ocrMetadataDirty && !window.confirm('Discard unsaved metadata edits?')) return;
-    if (active && next !== 'scanner') leave(next);
+    if (active && next !== 'scanner') leave(next, nextId);
     else {
       setError('');
-      showView(next, next === 'scanner' ? active?.batch.id : null);
+      showView(next, next === 'scanner' ? active?.batch.id : nextId);
     }
   }
   function backFromDocument() {
@@ -317,6 +329,17 @@ function DigitalArchApp() {
         ? 'qc'
         : 'batches';
     navigate(route);
+  }
+  const openConfirmation = (id) => navigate('confirmation', id);
+  function backFromRecord() {
+    const returnTo = new URLSearchParams(window.location.search).get('returnTo');
+    const origin = returnTo?.split('?')[0];
+    const requested =
+      origin && (['/documents', '/approvals'].includes(origin) || origin.startsWith('/records/'))
+        ? matchRoute(origin)
+        : { view: 'documents' };
+    const route = permittedRoute(user, requested);
+    showView(route.view, route.recordId || null);
   }
   async function scannerAction(route, body = {}) {
     if (route === 'mode') setRequestedMode(body.mode);
@@ -396,11 +419,35 @@ function DigitalArchApp() {
     ...(can('users:read')
       ? [{ key: 'users', label: 'Users', icon: <TeamOutlined aria-hidden /> }]
       : []),
+    ...(can('viewers:approve')
+      ? [
+          {
+            key: 'viewerRequests',
+            label: 'Viewer registrations',
+            icon: <TeamOutlined aria-hidden />,
+          },
+        ]
+      : []),
+    ...(can('archive:read') && !can('documents:read')
+      ? [{ key: 'viewer', label: 'Documents', icon: <FileTextOutlined aria-hidden /> }]
+      : []),
     ...(can('ocr:read')
       ? [{ key: 'ocr', label: 'OCR Processing', icon: <FileTextOutlined aria-hidden /> }]
       : []),
     ...(can('qc:read')
       ? [{ key: 'qc', label: 'QC Queue', icon: <FileTextOutlined aria-hidden /> }]
+      : []),
+    ...(can('documents:read')
+      ? [{ key: 'documents', label: 'Documents', icon: <FileTextOutlined aria-hidden /> }]
+      : []),
+    ...(can('approval_l1:review') || can('approval_l2:review')
+      ? [
+          {
+            key: 'approvals',
+            label: can('approval_l1:review') ? 'L1 approvals' : 'L2 approvals',
+            icon: <FileTextOutlined aria-hidden />,
+          },
+        ]
       : []),
     ...(can('batches:reassign')
       ? [{ key: 'assignments', label: 'Batch assignments', icon: <FileTextOutlined aria-hidden /> }]
@@ -441,7 +488,11 @@ function DigitalArchApp() {
           <ScanOutlined /> DigitalArch
         </span>
         <span className="header-module">
-          {can('users:read') && !operational ? 'Administration' : 'Document capture'}
+          {view === 'viewer'
+            ? 'Published library'
+            : can('users:read') && !operational
+              ? 'Administration'
+              : 'Document capture'}
         </span>
         <div className="header-operational">
           {can('scanner:read') && (
@@ -499,7 +550,15 @@ function DigitalArchApp() {
           <Menu
             mode="horizontal"
             disabled={busy}
-            selectedKeys={[view === 'document' ? (can('qc:read') ? 'qc' : 'batches') : view]}
+            selectedKeys={[
+              view === 'document'
+                ? can('qc:read')
+                  ? 'qc'
+                  : 'batches'
+                : ['record', 'confirmation'].includes(view)
+                  ? 'documents'
+                  : view,
+            ]}
             items={items}
             onClick={({ key }) => navigate(key)}
           />
@@ -682,6 +741,33 @@ function DigitalArchApp() {
                 onDirtyChange={setOcrMetadataDirty}
                 onStatusChange={setDocumentStatus}
               />
+            ) : view === 'viewer' ? (
+              <ViewerWorkspace key={user.id} />
+            ) : view === 'viewerRequests' ? (
+              <ViewerRegistrations />
+            ) : ['documents', 'approvals'].includes(view) ? (
+              <Documents
+                key={view}
+                user={user}
+                approvals={view === 'approvals'}
+                onOpen={(id) => showView('record', id)}
+              />
+            ) : view === 'record' && documentBatchId ? (
+              <ApprovalDocument
+                key={documentBatchId}
+                batchId={documentBatchId}
+                user={user}
+                onBack={backFromRecord}
+                onOpenConfirmation={openConfirmation}
+                onOpenQc={(id) => showView('document', id)}
+              />
+            ) : view === 'confirmation' && documentBatchId ? (
+              <ApprovalConfirmation
+                key={documentBatchId}
+                id={documentBatchId}
+                onBack={backFromRecord}
+                onOpenDocument={(id) => showView('record', id)}
+              />
             ) : view === 'settings' ? (
               <OcrSettings user={user} />
             ) : view === 'assignments' ? (
@@ -694,10 +780,7 @@ function DigitalArchApp() {
                   description={
                     <>
                       <h1>Your workspace is not yet available</h1>
-                      <p>
-                        Your account is ready. Approval and published archive workflows will be
-                        introduced in a later phase.
-                      </p>
+                      <p>Your account has no workspace permissions. Contact your administrator.</p>
                     </>
                   }
                 />
@@ -706,6 +789,7 @@ function DigitalArchApp() {
           </Suspense>
         </div>
       </Layout.Content>
+      <ApprovalNotifications user={user} onOpen={openConfirmation} />
       <footer className={`status-bar${ocrFooter ? ' status-bar-ocr' : ''}`}>
         <span title={ocrFooter?.text}>
           {view === 'document'
@@ -714,9 +798,11 @@ function DigitalArchApp() {
               : 'Document review'
             : view === 'ocr' && ocrJobId
               ? ocrFooter?.text || 'OCR job'
-              : active
-                ? active.batch.batch_code
-                : 'No active batch'}
+              : view === 'viewer'
+                ? 'Published document library · Viewer activity is recorded'
+                : active
+                  ? active.batch.batch_code
+                  : 'No active batch'}
         </span>
         {ocrFooter && (
           <Progress

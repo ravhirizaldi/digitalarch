@@ -3,6 +3,7 @@ import { Alert, Button, Checkbox, Descriptions, Form, Select, Spin } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons';
 import { api } from './api';
 import { dateTime } from './ui';
+import ApprovalSettings from './ApprovalSettings';
 
 const stepLabels = {
   grayscale: 'Grayscale',
@@ -110,6 +111,7 @@ export default function OcrSettings({ user }) {
         />
       )}
       <div className="ocr-settings-body" aria-busy={loading || saving}>
+        <ApprovalSettings user={user} />
         {loading && !data ? (
           <Spin />
         ) : (

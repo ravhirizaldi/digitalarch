@@ -2,11 +2,18 @@ import { hash, verify, Algorithm } from '@node-rs/argon2';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { transaction } from './db.mjs';
 import { failure } from './errors.mjs';
+import { isViewer, viewerAudit } from './viewer-audit.mjs';
 
 export const digest = (value) => createHash('sha256').update(value).digest('hex');
 const csrfFor = (token) =>
   createHmac('sha256', token).update('digitalarch:csrf').digest('base64url');
 export const temporaryPassword = () => randomBytes(24).toString('base64url');
+function accountPassword(value) {
+  if (value === undefined) return temporaryPassword();
+  if (typeof value !== 'string' || value.length < 12 || value.length > 256 || !value.trim())
+    throw failure('invalid_password', 'Use a temporary password with 12–256 characters.');
+  return value;
+}
 export const passwordHash = (password) =>
   hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 65536, timeCost: 3, parallelism: 1 });
 const dummyHash = passwordHash(temporaryPassword());
@@ -61,7 +68,7 @@ export async function audit(
   );
 }
 
-const userSelect = `SELECT u.id,u.username,u.display_name,u.is_active,u.must_change_password,u.version,u.created_at,u.last_login_at,
+const userSelect = `SELECT u.id,u.username,u.display_name,u.is_active,u.must_change_password,u.version,u.created_at,u.last_login_at,u.deleted_at,u.viewer_registration_status,
   COALESCE((SELECT array_agg(r.code ORDER BY r.code) FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=u.id),'{}') AS roles,
   COALESCE((SELECT array_agg(DISTINCT p.code) FROM user_roles ur JOIN role_permissions rp ON rp.role_id=ur.role_id JOIN permissions p ON p.id=rp.permission_id WHERE ur.user_id=u.id),'{}') AS permissions FROM users u`;
 
@@ -93,17 +100,30 @@ export function authentication(pool) {
       if (!token) throw failure('unauthenticated', 'Sign in to DigitalArch.', 401);
       const session = (
         await pool.query(
-          'SELECT id,user_id,csrf_hash FROM auth_sessions WHERE token_hash=$1 AND revoked_at IS NULL AND expires_at>now()',
+          'SELECT id,user_id,csrf_hash,revoked_at,expires_at FROM auth_sessions WHERE token_hash=$1',
           [digest(token)],
         )
       ).rows[0];
       const user = session && (await api.user(session.user_id));
-      if (!user?.is_active)
+      if (
+        !user?.is_active ||
+        session.revoked_at ||
+        new Date(session.expires_at) <= new Date() ||
+        (user.viewer_registration_status && user.viewer_registration_status !== 'approved')
+      ) {
+        if (isViewer(user))
+          await viewerAudit(
+            pool,
+            'access',
+            { ...user, correlationId: req.correlationId },
+            'session_denied',
+          );
         throw failure(
           'unauthenticated',
           'Your session expired or was revoked. Sign in again.',
           401,
         );
+      }
       return { user, session, csrfToken: csrfFor(token) };
     },
     csrf(req, session) {
@@ -137,11 +157,31 @@ export function authentication(pool) {
             throw failure('rate_limited', 'Too many failed sign-ins. Wait 15 minutes.', 429);
           const account = (
             await client.query(
-              'SELECT id,password_hash,is_active FROM users WHERE lower(username)=$1 FOR UPDATE',
+              'SELECT id,password_hash,is_active,deleted_at,viewer_registration_status FROM users WHERE lower(username)=$1 FOR UPDATE',
               [username],
             )
           ).rows[0];
           const valid = await verify(account?.password_hash || (await dummyHash), body.password);
+          const details = account && (await api.user(account.id, client));
+          if (
+            valid &&
+            account &&
+            !account.deleted_at &&
+            ['pending', 'rejected'].includes(account.viewer_registration_status)
+          ) {
+            await client.query('DELETE FROM auth_login_attempts WHERE username=$1', [username]);
+            await viewerAudit(
+              client,
+              'access',
+              { ...details, correlationId },
+              'registration_status',
+              {
+                subjectId: account.id,
+                metadata: { status: account.viewer_registration_status },
+              },
+            );
+            return { registrationStatus: account.viewer_registration_status };
+          }
           if (!valid || !account?.is_active) {
             await client.query(
               `INSERT INTO auth_login_attempts(username,attempts) VALUES($1,1) ON CONFLICT(username) DO UPDATE SET
@@ -149,15 +189,19 @@ export function authentication(pool) {
               window_started_at=CASE WHEN auth_login_attempts.window_started_at < now()-interval '15 minutes' THEN now() ELSE auth_login_attempts.window_started_at END`,
               [username],
             );
+            if (isViewer(details))
+              await viewerAudit(client, 'access', { ...details, correlationId }, 'login_failed');
             return null;
           }
           await client.query('DELETE FROM auth_login_attempts WHERE username=$1', [username]);
           await client.query('UPDATE users SET last_login_at=now() WHERE id=$1', [account.id]);
           await audit(client, account, 'auth.login', 'user', account.id, {}, null, correlationId);
+          if (isViewer(details))
+            await viewerAudit(client, 'access', { ...details, correlationId }, 'login');
           return { user: await api.user(account.id, client), ...(await issue(client, account.id)) };
         });
         if (!result) throw failure('invalid_credentials', 'Invalid username or password.', 401);
-        res.setHeader('Set-Cookie', result.sessionCookie);
+        if (result.sessionCookie) res.setHeader('Set-Cookie', result.sessionCookie);
         delete result.sessionCookie;
         return result;
       } finally {
@@ -170,6 +214,7 @@ export function authentication(pool) {
           context.session.id,
         ]);
         await audit(client, context.user, 'auth.logout', 'user', context.user.id);
+        if (isViewer(context.user)) await viewerAudit(client, 'access', context.user, 'logout');
       });
       res.setHeader('Set-Cookie', cookie('', 0));
       return { ok: true };
@@ -202,6 +247,8 @@ export function authentication(pool) {
           [context.user.id],
         );
         await audit(client, context.user, 'auth.password_changed', 'user', context.user.id);
+        if (isViewer(context.user))
+          await viewerAudit(client, 'access', context.user, 'password_changed');
         return {
           user: await api.user(context.user.id, client),
           ...(await issue(client, context.user.id)),
@@ -243,15 +290,72 @@ export function administration(pool, auth) {
   async function lock(client) {
     await client.query("SELECT pg_advisory_xact_lock(hashtext('digitalarch:administrators'))");
   }
+  async function currentAccount(client, id, version) {
+    if (
+      !(
+        await client.query('SELECT id FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE', [
+          id,
+        ])
+      ).rowCount
+    )
+      throw failure('not_found', 'User not found or already deleted.', 404);
+    const current = await auth.user(id, client);
+    if (version !== undefined && current.version !== version)
+      throw failure('conflict', `${current.username} changed. Refresh before trying again.`, 409);
+    return current;
+  }
+  async function protectAdmin(client, actor, current, active, nextRoles) {
+    if (actor.id === current.id && (!active || !nextRoles.includes('system_admin')))
+      throw failure(
+        'own_admin_access',
+        'You cannot delete/disable yourself or remove your administrative access.',
+        409,
+      );
+    if (
+      current.is_active &&
+      current.roles.includes('system_admin') &&
+      (!active || !nextRoles.includes('system_admin'))
+    ) {
+      const count = (
+        await client.query(
+          "SELECT count(*)::int FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id WHERE u.is_active AND r.code='system_admin'",
+        )
+      ).rows[0].count;
+      if (count <= 1)
+        throw failure(
+          'last_admin',
+          'The last active system administrator must remain enabled.',
+          409,
+        );
+    }
+  }
+  async function resetAccount(client, actor, account, password) {
+    await client.query(
+      'UPDATE users SET password_hash=$2,must_change_password=true,updated_at=now(),version=version+1 WHERE id=$1',
+      [account.id, await passwordHash(password)],
+    );
+    await client.query(
+      'UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',
+      [account.id],
+    );
+    await audit(client, actor, 'user.password_reset', 'user', account.id);
+    if (isViewer(account))
+      await viewerAudit(client, 'access', actor, 'password_reset', { subjectId: account.id });
+    return { username: account.username, password };
+  }
   return {
     async list() {
       return {
-        users: (await pool.query(`${userSelect} ORDER BY lower(u.username)`)).rows,
+        users: (
+          await pool.query(
+            `${userSelect} WHERE u.deleted_at IS NULL AND (u.viewer_registration_status IS NULL OR u.viewer_registration_status='approved') ORDER BY lower(u.username)`,
+          )
+        ).rows,
         roles: (await pool.query('SELECT code,display_name FROM roles ORDER BY display_name')).rows,
       };
     },
     async create(actor, body, bootstrap = false) {
-      keys(body, ['username', 'displayName', 'roles']);
+      keys(body, ['username', 'displayName', 'roles', ...(bootstrap ? [] : ['password'])]);
       const username = text(body.username, 64, 'Username');
       if (!/^[a-zA-Z0-9_.-]{3,64}$/.test(username))
         throw failure(
@@ -259,7 +363,7 @@ export function administration(pool, auth) {
           'Username needs 3–64 letters, digits, dots, dashes or underscores.',
         );
       const displayName = text(body.displayName, 120, 'Display name');
-      const password = temporaryPassword();
+      const password = accountPassword(body.password);
       const result = await transaction(pool, async (client) => {
         await lock(client);
         if (
@@ -288,6 +392,8 @@ export function administration(pool, auth) {
             role.id,
           ]);
         await audit(client, actor, 'user.created', 'user', id, { roles: body.roles, bootstrap });
+        if (body.roles.includes('archive_viewer'))
+          await viewerAudit(client, 'registration', actor, 'admin_created', { subjectId: id });
         return auth.user(id, client);
       });
       return { user: result, temporaryPassword: password };
@@ -299,36 +405,19 @@ export function administration(pool, auth) {
         throw failure('invalid_request', 'isActive must be boolean.');
       return transaction(pool, async (client) => {
         await lock(client);
-        const current = await auth.user(id, client);
-        if (!current) throw failure('not_found', 'User not found.', 404);
+        const current = await currentAccount(client, id, body.version);
+        if (['pending', 'rejected'].includes(current.viewer_registration_status))
+          throw failure(
+            'registration_pending',
+            'Use Viewer registrations to decide this request.',
+            409,
+          );
         if (current.version !== body.version)
           throw failure('conflict', 'This account changed. Reload before editing.', 409);
         const assigned = body.roles === undefined ? null : await roles(client, body.roles);
         const active = body.isActive ?? current.is_active;
         const nextRoles = body.roles ?? current.roles;
-        if (actor.id === id && (!active || !nextRoles.includes('system_admin')))
-          throw failure(
-            'own_admin_access',
-            'You cannot disable yourself or remove your administrative access.',
-            409,
-          );
-        if (
-          current.is_active &&
-          current.roles.includes('system_admin') &&
-          (!active || !nextRoles.includes('system_admin'))
-        ) {
-          const count = (
-            await client.query(
-              "SELECT count(*)::int FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id WHERE u.is_active AND r.code='system_admin'",
-            )
-          ).rows[0].count;
-          if (count <= 1)
-            throw failure(
-              'last_admin',
-              'The last active system administrator must remain enabled.',
-              409,
-            );
-        }
+        await protectAdmin(client, actor, current, active, nextRoles);
         await client.query(
           'UPDATE users SET display_name=$2,is_active=$3,updated_at=now(),version=version+1 WHERE id=$1',
           [
@@ -358,38 +447,105 @@ export function administration(pool, auth) {
         await audit(client, actor, active ? 'user.updated' : 'user.disabled', 'user', id, {
           isActive: active,
         });
+        if (isViewer(current) || nextRoles.includes('archive_viewer'))
+          await viewerAudit(
+            client,
+            'registration',
+            actor,
+            active ? 'account_updated' : 'disabled',
+            { subjectId: id, metadata: { isActive: active, roles: nextRoles } },
+          );
         return { user: await auth.user(id, client) };
       });
     },
-    async reset(actor, id) {
+    async reset(actor, id, body = {}) {
       uuid(id);
-      const password = temporaryPassword();
+      keys(body, ['password', 'version']);
+      if (!Number.isSafeInteger(body.version) || body.version < 1)
+        throw failure('invalid_request', 'The current user version is required.');
+      const password = accountPassword(body.password);
       await transaction(pool, async (client) => {
-        if (
-          !(
-            await client.query(
-              'UPDATE users SET password_hash=$2,must_change_password=true,updated_at=now(),version=version+1 WHERE id=$1 RETURNING id',
-              [id, await passwordHash(password)],
-            )
-          ).rowCount
-        )
-          throw failure('not_found', 'User not found.', 404);
-        await client.query(
-          'UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',
-          [id],
-        );
-        await audit(client, actor, 'user.password_reset', 'user', id);
+        await lock(client);
+        await resetAccount(client, actor, await currentAccount(client, id, body.version), password);
       });
       return { temporaryPassword: password };
     },
-    async logs(limit = 100, offset = 0) {
+    async bulk(actor, body) {
+      keys(body, ['action', 'users', ...(body?.action === 'reset-password' ? ['password'] : [])]);
+      if (
+        !['delete', 'reset-password'].includes(body.action) ||
+        !Array.isArray(body.users) ||
+        !body.users.length ||
+        body.users.length > 100
+      )
+        throw failure('invalid_request', 'Select 1–100 users and a supported action.');
+      for (const target of body.users) {
+        keys(target, ['id', 'version']);
+        uuid(target.id);
+        if (!Number.isSafeInteger(target.version) || target.version < 1)
+          throw failure('invalid_request', 'Each selected user needs its current version.');
+      }
+      if (new Set(body.users.map(({ id }) => id.toLowerCase())).size !== body.users.length)
+        throw failure('invalid_request', 'Select distinct users.');
+      const sharedPassword =
+        body.password === undefined ? undefined : accountPassword(body.password);
+      return transaction(pool, async (client) => {
+        await lock(client);
+        const credentials = [];
+        for (const target of [...body.users].sort((a, b) => a.id.localeCompare(b.id))) {
+          const account = await currentAccount(client, target.id, target.version);
+          if (body.action === 'delete') {
+            await protectAdmin(client, actor, account, false, account.roles);
+            await client.query(
+              'UPDATE users SET is_active=false,deleted_at=now(),updated_at=now(),version=version+1 WHERE id=$1',
+              [account.id],
+            );
+            await client.query(
+              'UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL',
+              [account.id],
+            );
+            await audit(client, actor, 'user.deleted', 'user', account.id);
+            if (isViewer(account))
+              await viewerAudit(client, 'registration', actor, 'deleted', {
+                subjectId: account.id,
+              });
+          } else {
+            credentials.push(
+              await resetAccount(client, actor, account, sharedPassword ?? temporaryPassword()),
+            );
+          }
+        }
+        return { affected: body.users.length, credentials };
+      });
+    },
+    async logs(limit = 100, offset = 0, { category = 'all', search = '' } = {}) {
+      if (
+        typeof category !== 'string' ||
+        (category !== 'all' && !/^[a-z][a-z0-9_]{0,63}$/.test(category))
+      )
+        throw failure('invalid_request', 'Invalid audit category.');
+      if (typeof search !== 'string' || search.length > 240)
+        throw failure('invalid_request', 'Search must contain at most 240 characters.');
+      const query = search.trim();
+      const from = `FROM all_audit_logs a LEFT JOIN users u ON u.id=a.actor_id
+        WHERE ($1='all' OR split_part(a.action,'.',1)=$1)
+          AND ($2='' OR strpos(lower(concat_ws(' ',a.action,u.username,a.entity_type,a.entity_id::text)),lower($2))>0)`;
+      const values = [category, query];
       return {
         logs: (
           await pool.query(
-            'SELECT a.*,u.username AS actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC,a.id LIMIT $1 OFFSET $2',
-            [limit, offset],
+            `SELECT a.*,u.username AS actor ${from} ORDER BY a.created_at DESC,a.id LIMIT $3 OFFSET $4`,
+            [...values, limit, offset],
           )
         ).rows,
+        total: (await pool.query(`SELECT count(*)::int AS total ${from}`, values)).rows[0].total,
+        counts: Object.fromEntries(
+          (
+            await pool.query(
+              "SELECT split_part(action,'.',1) AS category,count(*)::int AS total FROM all_audit_logs GROUP BY 1 ORDER BY 1",
+            )
+          ).rows.map(({ category, total }) => [category, total]),
+        ),
       };
     },
   };

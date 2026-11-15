@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { startDevelopment } from '../scripts/dev.mjs';
 import { testApplication } from './support.mjs';
 
@@ -32,6 +33,25 @@ test('development: HMR and protected same-origin API proxy, no CORS or authentic
   assert.equal((await send({})).status, 200);
   assert.equal((await send({ Origin: 'https://evil.example' })).status, 403);
   assert.equal((await send({ 'X-CSRF-Token': '' })).status, 403);
+  const qr = f.app.approval.qr;
+  let verificationOrigin;
+  f.app.approval.qr = async (_user, _id, origin) => {
+    verificationOrigin = origin;
+    return { buffer: Buffer.from('<svg/>'), mime: 'image/svg+xml' };
+  };
+  try {
+    const response = await fetch(`${origin}/api/confirmations/${randomUUID()}/qr`, {
+      headers: { Cookie: operator.cookie, 'X-Forwarded-Host': 'untrusted.example' },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(
+      verificationOrigin,
+      origin,
+      'QR must use the browser origin, not the temporary backend or forwarded headers',
+    );
+  } finally {
+    f.app.approval.qr = qr;
+  }
   const hostileHostStatus = await new Promise((resolve, reject) => {
     request(origin + '/api/auth/me', { headers: { Host: 'untrusted.example' } }, (response) => {
       response.resume();

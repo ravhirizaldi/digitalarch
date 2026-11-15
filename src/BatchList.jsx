@@ -123,6 +123,7 @@ const workflowLabels = {
   awaiting_approval_l1: 'Awaiting L1',
   awaiting_approval_l2: 'Awaiting L2',
   approved: 'Final approved',
+  dropped: 'Dropped',
 };
 
 export default function BatchList({
@@ -580,7 +581,7 @@ export default function BatchList({
               image={Empty.PRESENTED_IMAGE_SIMPLE}
               description={
                 status === 'completed'
-                  ? 'No final-approved batches. Final approval is not implemented yet; QC-passed work stays in Submitted / Tracking.'
+                  ? 'No published batches match this view. Work awaiting approval remains in Submitted / Tracking.'
                   : status === 'submitted'
                     ? 'No submitted batches match this view.'
                     : status === 'capture_completed'

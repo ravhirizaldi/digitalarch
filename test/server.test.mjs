@@ -17,7 +17,7 @@ test('database: vector, migration idempotency, UUID relationships, constraints, 
   );
   await migrate(f.pool);
   await migrate(f.pool);
-  assert.equal((await f.pool.query('SELECT * FROM schema_migrations')).rowCount, 14);
+  assert.equal((await f.pool.query('SELECT * FROM schema_migrations')).rowCount, 16);
   const operator = await f.account();
   const a = (await operator.request('/api/batches', { physicalLocation: 'Rack A-12' })).body;
   const b = (await operator.request('/api/batches', { physicalLocation: 'Rack A-12' })).body;
@@ -380,7 +380,9 @@ test('RBAC: all six roles, admin separation, cross-owner access, role policy and
   assert.equal(reassigned.status, 200);
   assert.equal((await operator.request(`/api/batches/${batch.id}`)).status, 403);
   assert.equal((await other.request(`/api/batches/${batch.id}`)).status, 200);
-  const reset = await f.admin.request(`/api/admin/users/${other.user.id}/reset-password`, {});
+  const reset = await f.admin.request(`/api/admin/users/${other.user.id}/reset-password`, {
+    version: (await f.app.auth.user(other.user.id)).version,
+  });
   assert.ok(reset.body.temporaryPassword);
   assert.equal((await other.request('/api/auth/me')).status, 401);
   const logs = await f.admin.request('/api/admin/audit-logs');

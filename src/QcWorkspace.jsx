@@ -150,6 +150,9 @@ const label = (value) =>
     qc_in_review: 'QC review',
     rework: 'Returned from QC',
     awaiting_approval_l1: 'Awaiting L1',
+    awaiting_approval_l2: 'Awaiting L2',
+    approved: 'Published',
+    dropped: 'Dropped',
   })[value] ||
   value?.replaceAll('_', ' ') ||
   '—';
@@ -300,7 +303,7 @@ export function QcQueue({ onOpen }) {
               label: (
                 <span className="qc-tab-label">
                   <UserOutlined aria-hidden />
-                  Claimed documents<span className="qc-tab-count">{data.counts.mine ?? '—'}</span>
+                  My QC work<span className="qc-tab-count">{data.counts.mine ?? '—'}</span>
                 </span>
               ),
             },
@@ -413,7 +416,7 @@ export function QcQueue({ onOpen }) {
         locale={{
           emptyText:
             queueTab === 'mine'
-              ? 'No claimed documents. Claim a document from the shared QC queue to start a review.'
+              ? 'No claimed or assigned documents. Claim a document from the shared QC queue to start a review.'
               : 'No documents match this queue view.',
         }}
         dataSource={data.batches}
@@ -623,17 +626,31 @@ export default function QcWorkspace({
           ? 'Waiting for a reviewer. Operator edits are locked until QC returns the document.'
           : 'Claim document before making corrections. Fill missing metadata and review the pages before QC Pass.',
       };
-    } else if (workflow === 'awaiting_approval_l1') {
+    } else if (
+      ['awaiting_approval_l1', 'awaiting_approval_l2', 'approved', 'dropped'].includes(workflow)
+    ) {
       notice = {
         type: 'info',
-        title: 'QC passed',
-        description: 'Reviewed revision locked. L1/L2 approval is not implemented yet.',
+        title: label(workflow),
+        description:
+          workflow === 'dropped'
+            ? 'This batch was closed without publication. Originals and history are retained.'
+            : workflow === 'approved'
+              ? 'Publication was explicitly confirmed. The reviewed revision remains locked.'
+              : 'The reviewed revision is locked. Approval decisions are available in the Documents registry and approval queues.',
       };
     } else if (workflow === 'qc_in_review' && !mine) {
       notice = {
         type: 'info',
         title: 'Read-only review',
         description: `${review?.reviewer || 'QC Officer'} · Claim expires ${dateTime(review?.claim_expires_at)}`,
+      };
+    }
+    if (['qc_waiting', 'qc_in_review'].includes(workflow) && review?.approval_return_reason) {
+      notice = {
+        type: 'warning',
+        title: 'Returned from approval',
+        description: `${review.approval_return_reason}\n\nAssigned to ${review.assigned_reviewer || 'the QC queue'}. A new QC Pass and fresh approval decisions are required.`,
       };
     }
     if (workflow === 'rework') {
@@ -947,7 +964,13 @@ export default function QcWorkspace({
           .join(', ') || 'None configured (QC must still review metadata).'}
       </p>
       {can('qc:configure') &&
-        !['qc_in_review', 'awaiting_approval_l1'].includes(data.document.workflow_status) && (
+        ![
+          'qc_in_review',
+          'awaiting_approval_l1',
+          'awaiting_approval_l2',
+          'approved',
+          'dropped',
+        ].includes(data.document.workflow_status) && (
           <details
             className="qc-disclosure"
             open={viewState.policy}
@@ -1415,9 +1438,18 @@ export default function QcWorkspace({
                   >
                     {r.outcome || 'Draft'}
                   </Tag>
-                  <span className="qc-history-reviewer">{r.reviewer || 'Unclaimed'}</span>
+                  <span className="qc-history-reviewer">
+                    {r.reviewer ||
+                      (r.assigned_reviewer ? `Assigned: ${r.assigned_reviewer}` : 'Unclaimed')}
+                  </span>
                 </div>
                 {r.decision_reason && <p>{r.decision_reason}</p>}
+                {r.carried_from_review_id && (
+                  <p>Original QC Pass carried forward unchanged; no new QC inspection.</p>
+                )}
+                {r.approval_return_reason && (
+                  <p>Returned from approval: {r.approval_return_reason}</p>
+                )}
                 <div className="qc-history-meta">
                   {r.decided_at && <time>{dateTime(r.decided_at)}</time>}
                   <span>Revision {r.reviewed_revision || '—'}</span>
@@ -1513,7 +1545,14 @@ export default function QcWorkspace({
         {can('qc:review') &&
           ['qc_waiting', 'qc_in_review'].includes(data.document.workflow_status) &&
           !mine && (
-            <Button type="primary" disabled={working} onClick={() => action('claim')}>
+            <Button
+              type="primary"
+              disabled={
+                working ||
+                (!!review?.assigned_reviewer_id && review.assigned_reviewer_id !== user.id)
+              }
+              onClick={() => action('claim')}
+            >
               Claim document
             </Button>
           )}
@@ -1558,16 +1597,19 @@ export default function QcWorkspace({
             </Button>
           </>
         )}
-        {can('qc:reassign') && data.document.workflow_status === 'qc_in_review' && !mine && (
-          <Button
-            onClick={() => {
-              setDecision('reassign');
-              setReason('');
-            }}
-          >
-            Release for reassignment
-          </Button>
-        )}
+        {can('qc:reassign') &&
+          (data.document.workflow_status === 'qc_in_review' ||
+            (data.document.workflow_status === 'qc_waiting' && review?.assigned_reviewer_id)) &&
+          !mine && (
+            <Button
+              onClick={() => {
+                setDecision('reassign');
+                setReason('');
+              }}
+            >
+              Release for reassignment
+            </Button>
+          )}
       </div>
       {error && <Alert type="error" showIcon title={error} closable onClose={() => setError('')} />}
       <Splitter className="workstation-split qc-split">
@@ -1767,7 +1809,7 @@ export default function QcWorkspace({
             />
             {mine && page && (
               <div className="panel-footer">
-                <Space>
+                <Space wrap>
                   <Button
                     disabled={working}
                     onClick={() =>
@@ -1785,16 +1827,16 @@ export default function QcWorkspace({
                     Needs correction
                   </Button>
                   <Popconfirm
-                    title="Explicitly mark this visible list window reviewed?"
-                    description="Only use after inspecting these pages. Other pages are not marked."
+                    title="Mark all included pages reviewed?"
+                    description="Confirm your sampling review, such as the cover and selected pages. Applies across all sessions, regardless of filters. Needs correction flags remain; QC Pass is separate."
                     onConfirm={() =>
                       action('page-review', {
-                        pageIds: visible.slice((listPage - 1) * 40, listPage * 40).map((p) => p.id),
+                        all: true,
                         status: 'reviewed',
                       })
                     }
                   >
-                    <Button disabled={working}>Review list window</Button>
+                    <Button disabled={working}>Mark all pages reviewed</Button>
                   </Popconfirm>
                 </Space>
               </div>

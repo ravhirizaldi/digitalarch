@@ -122,18 +122,82 @@ try {
     await page.getByRole('menuitem', { name: 'Capture Workspace', exact: true }).count(),
     0,
   );
+  for (const name of [
+    'All users',
+    'System Administrator',
+    'Operator',
+    'QC Officer',
+    'Approver Level 1',
+    'Approver Level 2',
+    'Archive Viewer',
+  ])
+    await page.getByRole('tab', { name: new RegExp(name) }).waitFor();
+  const createUser = page.getByRole('button', { name: 'Create user', exact: true });
+  assert.equal(
+    await createUser.evaluate((button) =>
+      button.closest('.ant-space').contains(document.querySelector('button[aria-label="Refresh"]')),
+    ),
+    true,
+  );
   await page.getByRole('button', { name: 'Create user', exact: true }).click();
   await page.getByLabel('Username', { exact: true }).fill('browser-operator');
   await page.getByLabel('Display name', { exact: true }).fill('Capture Operator');
   await choose('Roles', 'Operator');
   await page.keyboard.press('Escape');
-  await page.getByRole('dialog').getByRole('button', { name: 'OK', exact: true }).click();
+  await page.getByRole('radio', { name: 'Auto-generate', exact: true }).check();
+  await page.getByRole('dialog').getByRole('button', { name: 'Create user', exact: true }).click();
   await page.getByText('Temporary credentials · shown once', { exact: true }).waitFor();
   const temporary = await page.locator('.temporary-password').innerText();
   await page.getByRole('button', { name: 'I have saved these credentials' }).click();
+  await page.getByRole('tab', { name: /^Operator/ }).click();
+  const operatorRow = page.getByRole('row').filter({ hasText: 'browser-operator' });
+  await operatorRow.waitFor();
+  for (const label of ['Edit user', 'Disable user', 'Reset password', 'Delete user']) {
+    const action = operatorRow.getByRole('button', { name: label, exact: true });
+    assert.equal((await action.textContent()).trim(), '', 'Row actions are icon-only');
+  }
+  await operatorRow.getByRole('button', { name: 'Reset password', exact: true }).click();
+  const resetModal = page.getByRole('dialog', {
+    name: 'Reset password · browser-operator',
+    exact: true,
+  });
+  await resetModal.getByRole('radio', { name: 'Set password', exact: true }).check();
+  await resetModal.getByLabel('Password', { exact: true }).fill('Browser temporary passphrase!');
+  await resetModal.getByLabel('Confirm password', { exact: true }).fill('Does not match yet');
+  await resetModal.getByRole('button', { name: 'Reset password', exact: true }).click();
+  await resetModal.getByText('Passwords do not match.', { exact: true }).waitFor();
+  await resetModal.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await operatorRow.getByRole('checkbox', { name: 'Select browser-operator', exact: true }).check();
+  await page.getByRole('button', { name: 'Reset selected passwords', exact: true }).click();
+  const bulkReset = page.getByRole('dialog', { name: 'Reset password · 1 users', exact: true });
+  await bulkReset.getByRole('radio', { name: 'Set password', exact: true }).check();
+  await bulkReset.getByLabel('Password', { exact: true }).fill('A shared browser password!');
+  await bulkReset
+    .getByLabel('Confirm password', { exact: true })
+    .fill('A shared browser password!');
+  await bulkReset.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete selected users', exact: true }).click();
+  const deleteDialog = page.getByRole('dialog', { name: 'Delete browser-operator?', exact: true });
+  await deleteDialog
+    .getByText(/Document ownership, original scans and audit history are retained/)
+    .waitFor();
+  await deleteDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.reload();
+  await page.getByRole('tab', { name: /^Operator/ }).waitFor();
+  assert.equal(
+    await page.getByRole('tab', { name: /^Operator/ }).getAttribute('aria-selected'),
+    'true',
+  );
   await contained('users-1366');
   await page.getByRole('menuitem', { name: 'Audit Logs', exact: true }).click();
-  await page.getByRole('cell', { name: 'user.created', exact: true }).first().waitFor();
+  await page.getByText('user.created', { exact: true }).first().waitFor();
+  await page.getByRole('tab', { name: /^Users & roles/ }).click();
+  await page.getByLabel('Search audit logs', { exact: true }).fill('user.created');
+  await page.getByText('user.created', { exact: true }).first().waitFor();
+  await page.getByRole('button', { name: 'View event details', exact: true }).first().click();
+  const auditModal = page.getByRole('dialog', { name: 'Audit event details', exact: true });
+  await auditModal.getByText('Event metadata', { exact: true }).waitFor();
+  await auditModal.getByRole('button', { name: 'Close', exact: true }).last().click();
   await contained('audit-1366');
   await page.getByRole('menuitem', { name: 'System', exact: true }).click();
   await page.getByRole('cell', { name: '0.8.7', exact: true }).waitFor();

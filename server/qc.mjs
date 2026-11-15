@@ -5,13 +5,13 @@ import {
   activeReview,
   checkVersion,
   documentFor,
-  independentReviewer,
   noCapture,
   operatorEdit,
   bumpDocument,
   publicPage,
   setPageLabel,
   requireSubmission,
+  qcOfficer,
 } from './workflow.mjs';
 import {
   currentOcr,
@@ -64,7 +64,7 @@ export function qualityControl(pool, storage) {
       checkVersion(doc, body.version);
       let review;
       if (qc) {
-        await independentReviewer(client, user, batch);
+        await qcOfficer(client, batch, user.id);
         review = await activeReview(client, doc, user);
       } else await operatorEdit(client, user, batch);
       const result = await operation(client, batch, doc, review);
@@ -138,8 +138,8 @@ export function qualityControl(pool, storage) {
       const where = `WHERE b.deleted_at IS NULL AND r.submitted_at IS NOT NULL AND
         CASE $1 WHEN 'all' THEN true WHEN 'waiting' THEN d.workflow_status='qc_waiting' OR (d.workflow_status='qc_in_review' AND r.claim_expires_at<=now())
           WHEN 'review' THEN d.workflow_status='qc_in_review' WHEN 'returned' THEN d.workflow_status='rework'
-          WHEN 'passed' THEN d.workflow_status='awaiting_approval_l1'
-          WHEN 'mine' THEN r.claimed_by=$2 AND r.outcome IS NULL
+          WHEN 'passed' THEN d.workflow_status IN ('awaiting_approval_l1','awaiting_approval_l2','approved')
+          WHEN 'mine' THEN (r.claimed_by=$2 OR r.assigned_reviewer_id=$2) AND r.outcome IS NULL
           ELSE d.workflow_status='preparing' OR coalesce(b.ocr_status,'')<>'completed' END
         AND ($3='' OR strpos(lower(concat_ws(' ',b.batch_code,d.title,d.document_type,d.archive_number,b.physical_location,u.display_name)),lower($3))>0)
         AND ($4='' OR d.metadata_status=$4)
@@ -175,9 +175,9 @@ export function qualityControl(pool, storage) {
         count(*) FILTER(WHERE d.workflow_status='qc_waiting' OR (d.workflow_status='qc_in_review' AND r.claim_expires_at<=now()))::int AS waiting,
         count(*) FILTER(WHERE d.workflow_status='qc_in_review')::int AS review,
         count(*) FILTER(WHERE d.workflow_status='rework')::int AS returned,
-        count(*) FILTER(WHERE d.workflow_status='awaiting_approval_l1')::int AS passed,
+         count(*) FILTER(WHERE d.workflow_status IN ('awaiting_approval_l1','awaiting_approval_l2','approved'))::int AS passed,
         count(*) FILTER(WHERE d.workflow_status='preparing' OR coalesce(b.ocr_status,'')<>'completed')::int AS ocr_incomplete,
-        count(*) FILTER(WHERE r.claimed_by=$1 AND r.outcome IS NULL)::int AS mine
+         count(*) FILTER(WHERE (r.claimed_by=$1 OR r.assigned_reviewer_id=$1) AND r.outcome IS NULL)::int AS mine
          ${from} WHERE b.deleted_at IS NULL AND r.submitted_at IS NOT NULL`,
             [user.id],
           )
@@ -205,8 +205,9 @@ export function qualityControl(pool, storage) {
         ).rows.map(publicPage);
         const reviews = (
           await client.query(
-            `SELECT r.*,u.display_name AS reviewer FROM qc_reviews r
-          LEFT JOIN users u ON u.id=coalesce(r.decided_by,r.claimed_by) WHERE document_id=$1 ORDER BY cycle DESC`,
+            `SELECT r.*,u.display_name AS reviewer,assignee.display_name AS assigned_reviewer FROM qc_reviews r
+          LEFT JOIN users u ON u.id=coalesce(r.decided_by,r.claimed_by)
+          LEFT JOIN users assignee ON assignee.id=r.assigned_reviewer_id WHERE document_id=$1 ORDER BY cycle DESC`,
             [doc.id],
           )
         ).rows;
@@ -247,7 +248,7 @@ export function qualityControl(pool, storage) {
       return transaction(pool, async (client) => {
         const { batch, doc } = await load(client, user, batchId, true);
         checkVersion(doc, body.version);
-        await independentReviewer(client, user, batch);
+        await qcOfficer(client, batch, user.id);
         await noCapture(client, batchId);
         if (!['qc_waiting', 'qc_in_review'].includes(doc.workflow_status))
           throw failure('workflow_locked', 'The document is not ready for QC.', 409);
@@ -260,6 +261,12 @@ export function qualityControl(pool, storage) {
         ).rows[0];
         if (!review?.submitted_at)
           throw failure('not_submitted', 'This document has not been sent to QC.', 409);
+        if (review.assigned_reviewer_id && review.assigned_reviewer_id !== user.id)
+          throw failure(
+            'assigned_review',
+            'This review is assigned to another QC officer. Ask an administrator to reassign it if needed.',
+            403,
+          );
         if (review.claimed_by && review.claimed_by !== user.id && review.claim_live)
           throw failure('already_claimed', 'Another QC Officer is reviewing this document.', 409);
         await client.query(
@@ -287,22 +294,23 @@ export function qualityControl(pool, storage) {
       });
     },
     async release(user, batchId, body, administrative = false) {
-      keys(body, administrative ? ['version', 'reason'] : ['version']);
+      keys(body, administrative ? ['version', 'reason', 'reviewerId'] : ['version']);
       return transaction(pool, async (client) => {
         const { batch, doc } = await load(client, user, batchId, true);
         checkVersion(doc, body.version);
         if (administrative) {
           requirePermission(user, 'qc:reassign');
           text(body.reason, 1000, 'Reassignment reason');
-          if (doc.workflow_status !== 'qc_in_review')
+          if (!['qc_in_review', 'qc_waiting'].includes(doc.workflow_status))
             throw failure('workflow_locked', 'No active review.', 409);
+          if (body.reviewerId) await qcOfficer(client, batch, uuid(body.reviewerId), true);
         } else {
-          await independentReviewer(client, user, batch);
+          await qcOfficer(client, batch, user.id);
           await activeReview(client, doc, user);
         }
         await client.query(
-          'UPDATE qc_reviews SET claimed_by=NULL,claim_expires_at=NULL,updated_at=now() WHERE document_id=$1 AND cycle=$2',
-          [doc.id, doc.review_cycle],
+          'UPDATE qc_reviews SET claimed_by=NULL,claim_expires_at=NULL,assigned_reviewer_id=CASE WHEN $3 THEN $4 ELSE assigned_reviewer_id END,updated_at=now() WHERE document_id=$1 AND cycle=$2',
+          [doc.id, doc.review_cycle, administrative, body.reviewerId || null],
         );
         await client.query(
           "UPDATE documents SET workflow_status='qc_waiting',version=version+1,updated_at=now() WHERE id=$1",
@@ -318,7 +326,7 @@ export function qualityControl(pool, storage) {
           administrative ? 'qc.reassigned' : 'qc.released',
           'document',
           doc.id,
-          { cycle: doc.review_cycle, reason: body.reason },
+          { cycle: doc.review_cycle, reason: body.reason, reviewerId: body.reviewerId || null },
           batchId,
         );
         return { released: true };
@@ -337,7 +345,7 @@ export function qualityControl(pool, storage) {
         const { batch, doc } = await load(client, user, batchId, true);
         const qc = doc.workflow_status === 'qc_in_review';
         if (qc) {
-          await independentReviewer(client, user, batch);
+          await qcOfficer(client, batch, user.id);
           await activeReview(client, doc, user);
         } else await operatorEdit(client, user, batch);
         if (extract) {
@@ -389,7 +397,15 @@ export function qualityControl(pool, storage) {
       return transaction(pool, async (client) => {
         const { doc } = await load(client, user, batchId, true);
         checkVersion(doc, body.version);
-        if (['qc_in_review', 'awaiting_approval_l1'].includes(doc.workflow_status))
+        if (
+          [
+            'qc_in_review',
+            'awaiting_approval_l1',
+            'awaiting_approval_l2',
+            'approved',
+            'dropped',
+          ].includes(doc.workflow_status)
+        )
           throw failure('document_locked', 'Policy cannot change during or after QC.', 409);
         await client.query(
           'UPDATE documents SET required_metadata=$2,version=version+1,revision=revision+1 WHERE id=$1',
@@ -538,37 +554,48 @@ export function qualityControl(pool, storage) {
       });
     },
     async pageReview(user, batchId, body) {
-      keys(body, ['version', 'pageIds', 'status']);
+      keys(body, ['version', 'pageIds', 'status', 'all']);
       if (
-        !Array.isArray(body.pageIds) ||
-        !body.pageIds.length ||
-        body.pageIds.length > 500 ||
+        (body.all !== undefined && typeof body.all !== 'boolean') ||
+        (body.all
+          ? body.pageIds !== undefined || body.status !== 'reviewed'
+          : !Array.isArray(body.pageIds) || !body.pageIds.length || body.pageIds.length > 500) ||
         !['reviewed', 'needs_correction'].includes(body.status)
       )
         throw failure('invalid_request', 'Select pages and a review status.');
-      body.pageIds.forEach(uuid);
+      if (!body.all) body.pageIds.forEach(uuid);
       return change(user, batchId, body, async (client, batch, doc, review) => {
         const pages = (
           await client.query(
-            'SELECT id,image_revision FROM pages WHERE batch_id=$1 AND id=ANY($2::uuid[]) AND NOT replacement_candidate',
-            [batchId, body.pageIds],
+            body.all
+              ? `SELECT p.id,p.image_revision FROM pages p
+                LEFT JOIN qc_page_reviews pr ON pr.page_id=p.id AND pr.review_id=$2
+                WHERE p.batch_id=$1 AND NOT p.is_excluded AND NOT p.replacement_candidate
+                  AND pr.status IS DISTINCT FROM 'needs_correction'`
+              : 'SELECT id,image_revision FROM pages WHERE batch_id=$1 AND id=ANY($2::uuid[]) AND NOT replacement_candidate',
+            [batchId, body.all ? review.id : body.pageIds],
           )
         ).rows;
-        if (pages.length !== new Set(body.pageIds).size)
+        if (!body.all && pages.length !== new Set(body.pageIds).size)
           throw failure('invalid_request', 'Invalid review pages.');
-        for (const page of pages)
-          await client.query(
-            `INSERT INTO qc_page_reviews(review_id,page_id,status,image_revision,reviewed_by) VALUES($1,$2,$3,$4,$5)
+        await client.query(
+          `INSERT INTO qc_page_reviews(review_id,page_id,status,image_revision,reviewed_by)
+            SELECT $1,p.id,$3,p.image_revision,$4 FROM pages p WHERE p.id=ANY($2::uuid[])
           ON CONFLICT(review_id,page_id) DO UPDATE SET status=EXCLUDED.status,image_revision=EXCLUDED.image_revision,reviewed_by=EXCLUDED.reviewed_by,reviewed_at=now()`,
-            [review.id, page.id, body.status, page.image_revision, user.id],
-          );
+          [review.id, pages.map((page) => page.id), body.status, user.id],
+        );
         await audit(
           client,
           user,
           'page.reviewed',
           'document',
           doc.id,
-          { pageIds: body.pageIds, status: body.status, explicitBulk: pages.length > 1 },
+          {
+            pageIds: pages.map((page) => page.id),
+            status: body.status,
+            explicitBulk: body.all || pages.length > 1,
+            ...(body.all ? { reviewMethod: 'sampling' } : {}),
+          },
           batchId,
         );
       });
@@ -842,6 +869,9 @@ export function qualityControl(pool, storage) {
           }
         }
         const effectiveOcr = await currentOcr(client, batchId, { includeText: false });
+        const approvalPolicy = pass
+          ? (await client.query('SELECT * FROM approval_settings FOR SHARE')).rows[0]
+          : null;
         const snapshot = {
           revision: doc.revision,
           metadata: metadataOf(doc),
@@ -864,6 +894,14 @@ export function qualityControl(pool, storage) {
               status,
             }),
           ),
+          ...(pass
+            ? {
+                approvalPolicy: {
+                  l2Required: doc.approval_l2_required ?? approvalPolicy.l2_required,
+                  version: doc.approval_policy_version ?? approvalPolicy.version,
+                },
+              }
+            : {}),
         };
         await client.query(
           `UPDATE qc_reviews SET outcome=$2,decision_reason=$3,decided_by=$4,decided_at=now(),
@@ -877,10 +915,15 @@ export function qualityControl(pool, storage) {
             JSON.stringify(snapshot),
           ],
         );
-        await client.query('UPDATE documents SET workflow_status=$2 WHERE id=$1', [
-          doc.id,
-          pass ? 'awaiting_approval_l1' : 'rework',
-        ]);
+        await client.query(
+          'UPDATE documents SET workflow_status=$2,approval_l2_required=coalesce(approval_l2_required,$3),approval_policy_version=coalesce(approval_policy_version,$4) WHERE id=$1',
+          [
+            doc.id,
+            pass ? 'awaiting_approval_l1' : 'rework',
+            approvalPolicy?.l2_required ?? null,
+            approvalPolicy?.version ?? null,
+          ],
+        );
         if (!pass)
           await client.query(
             "UPDATE archive_batches SET status='paused',paused_at=now() WHERE id=$1",

@@ -98,6 +98,13 @@ export async function independentReviewer(client, user, batch) {
     batch.assigned_operator_id === user.id ||
     (
       await client.query(
+        `SELECT 1 FROM audit_logs WHERE batch_id=$1 AND action='batch.reassigned'
+      AND (metadata->>'from'=$2 OR metadata->>'to'=$2) LIMIT 1`,
+        [batch.id, user.id],
+      )
+    ).rowCount ||
+    (
+      await client.query(
         'SELECT 1 FROM scan_sessions WHERE batch_id=$1 AND created_by=$2 LIMIT 1',
         [batch.id, user.id],
       )
@@ -105,9 +112,40 @@ export async function independentReviewer(client, user, batch) {
   )
     throw failure(
       'self_qc',
-      'You cannot QC a document you captured, created or currently operate.',
+      'You cannot review a document you captured, created or operated.',
       403,
     );
+}
+
+export async function qcOfficer(client, batch, id, lock = false) {
+  const officer = (
+    await client.query(
+      `SELECT u.id,u.display_name,u.username FROM users u WHERE u.id=$1
+    AND u.is_active AND u.deleted_at IS NULL AND EXISTS(SELECT 1 FROM user_roles ur
+      JOIN role_permissions rp ON rp.role_id=ur.role_id JOIN permissions p ON p.id=rp.permission_id
+      WHERE ur.user_id=u.id AND p.code='qc:review') ${lock ? 'FOR SHARE OF u' : ''}`,
+      [id],
+    )
+  ).rows[0];
+  if (!officer) throw failure('ineligible_officer', 'Choose an active QC officer.', 409);
+  await independentReviewer(client, officer, batch);
+  if (
+    (
+      await client.query(
+        `SELECT 1 FROM approval_decisions a JOIN qc_reviews r ON r.id=a.qc_review_id
+    JOIN documents d ON d.id=r.document_id WHERE d.batch_id=$1 AND a.decided_by=$2
+    UNION ALL SELECT 1 FROM publication_withdrawals w JOIN documents d ON d.id=w.document_id
+    WHERE d.batch_id=$1 AND w.taken_by=$2 LIMIT 1`,
+        [batch.id, id],
+      )
+    ).rowCount
+  )
+    throw failure(
+      'self_approval',
+      'Previous approvers cannot become the QC officer for this document.',
+      403,
+    );
+  return officer;
 }
 
 export async function activeReview(client, doc, user) {

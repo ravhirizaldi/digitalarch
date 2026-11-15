@@ -20,9 +20,23 @@ test('history routes: exact deep links, safe fallback and navigation round trips
     'system',
     'settings',
     'future',
+    'documents',
+    'approvals',
+    'viewer',
+    'viewerRequests',
+    'login',
+    'register',
   ])
     assert.deepEqual(matchRoute(routePath(view)), { view, batchId: null });
   assert.deepEqual(matchRoute('/'), { view: null, batchId: null });
+  assert.deepEqual(matchRoute(`/records/${id}`), { view: 'record', recordId: id, batchId: null });
+  assert.deepEqual(matchRoute(`/confirmations/${id}`), {
+    view: 'confirmation',
+    confirmationId: id,
+    batchId: null,
+  });
+  assert.equal(routePath('record', id), `/records/${id}`);
+  assert.equal(routePath('confirmation', id), `/confirmations/${id}`);
   for (const pathname of [
     '/scanner/invalid',
     '/api/batches',
@@ -50,7 +64,20 @@ test('history routes: role-aware restoration never grants a different workspace'
     view: 'audit',
     batchId: null,
   });
-  assert.deepEqual(permittedRoute(viewer, scanner), { view: 'future', batchId: null });
+  assert.deepEqual(permittedRoute(viewer, scanner), { view: 'viewer', batchId: null });
+  assert.equal(permittedRoute(viewer, matchRoute('/documents')).view, 'viewer');
+  assert.equal(permittedRoute(viewer, matchRoute('/register')).view, 'viewer');
+  assert.equal(permittedRoute(viewer, matchRoute('/login')).view, 'viewer');
+  assert.equal(permittedRoute(viewer, matchRoute(`/documents/${randomUUID()}`)).view, 'viewer');
+  assert.equal(permittedRoute(viewer, matchRoute('/admin/viewer-registrations')).view, 'viewer');
+  assert.equal(
+    permittedRoute({ permissions: ['documents:read', 'approval_l1:review'] }, null).view,
+    'approvals',
+  );
+  assert.equal(
+    permittedRoute({ permissions: ['documents:read'] }, matchRoute('/approvals')).view,
+    'documents',
+  );
   assert.deepEqual(permittedRoute(operator, null), { view: 'home', batchId: null });
   assert.deepEqual(matchRoute('/settings'), { view: 'settings', batchId: null });
   assert.equal(permittedRoute(operator, matchRoute('/settings')).view, 'home');

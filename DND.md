@@ -1,6 +1,6 @@
 # Design and development document
 
-**Baseline: 2026-11-14.** This is the as-built technical handoff for the local source through capture, OCR, metadata, QC and rework. “DND” here means design and development. [DESIGN.md](DESIGN.md) owns visual rules; [APPROVAL.md](APPROVAL.md) describes proposed, unimplemented L1/L2/viewer work.
+**Source baseline: 2026-11-15.** This handoff covers capture, OCR, metadata, QC/rework, configurable L1/L2 approval and staff Documents. “DND” means design and development. [DESIGN.md](DESIGN.md) owns visual rules; [APPROVAL.md](APPROVAL.md) defines decisions/QR receipts and [VIEWER.md](VIEWER.md) defines the separate approved-viewer library, PDF transfers and audit tables.
 
 **2026-11-15 extension:** migrations 012–013 add automatic included-page numbering and editable page labels, with batch-scoped numbering queries; details and permission boundaries are in [QC.md](QC.md#page-names-and-numbering). These follow-up changes remain runtime-unverified.
 
@@ -13,8 +13,8 @@
 | OCR                         | Persistent PostgreSQL queue, Tesseract and optional PaddleOCR, retained results, global defaults                  |
 | Metadata and QC             | Current document metadata, provenance/verification, exclusive claims, findings, corrections and same-batch rework |
 | Shared UI                   | Compact worklists, bounded document inspection and URL-backed QC/operator list state                              |
-| Handoff                     | QC Pass locks a reviewed snapshot at `awaiting_approval_l1`                                                       |
-| Still planned               | Approval Level 1, Approval Level 2 and an authenticated read-only archive viewer                                  |
+| Approval and Documents      | Fixed first-pass policy, L1/selected-L2 confirmation, QC returns, batch drops, scoped registry and QR receipts    |
+| Viewer library              | Administrator-approved registration, published metadata/images, list/grid/tabs and audited image-only PDFs        |
 
 Implemented in source does not mean freshly runtime-verified. Earlier Phase 4 test evidence predates the latest queue/shared-component/URL refinements. Those refinements received formatting and static checks only; see [ENGINEERING_REPORT.md](ENGINEERING_REPORT.md).
 
@@ -107,10 +107,13 @@ stateDiagram-v2
     rework --> rework: Complete Capture and finish OCR
     rework --> qc_waiting: Explicit resubmission and next review cycle
     qc_in_review --> awaiting_approval_l1: Pass guards and save snapshot
-    note right of awaiting_approval_l1
-        Current implementation stops here.
-        L1 and L2 decisions are not implemented.
-    end note
+    awaiting_approval_l1 --> awaiting_approval_l2: L1 confirms and nominates L2
+    awaiting_approval_l1 --> approved: Explicit confirmation under L1-only policy
+    awaiting_approval_l2 --> approved: Selected L2 confirms
+    awaiting_approval_l1 --> qc_waiting: Return with reason and new QC cycle
+    awaiting_approval_l2 --> qc_waiting: Return with reason and new QC cycle
+    awaiting_approval_l1 --> dropped: Drop entire batch with reason
+    awaiting_approval_l2 --> dropped: Drop entire batch with reason
 ```
 
 Lease expiry alone does not change `qc_in_review` to `qc_waiting`: the waiting queue includes expired reviews and permits a version-checked reclaim. Terminal failed/cancelled OCR permits explicit submission with warnings, not automatic handoff or QC Pass. The legacy `preparing` state remains supported only for already-submitted pre-014 work.
@@ -168,15 +171,15 @@ Batch-list `status` selects work/tracking views without changing `archive_batche
 - `capture_completed`: completed capture without a submitted current review cycle, excluding rework/final approval.
 - `rework`: current document rework; returns current-cycle `qc_return_reason` / `qc_returned_at` and defaults to `sort=returned_at&direction=desc`.
 - `submitted`: completed capture with current-cycle `qc_reviews.submitted_at`, excluding current rework/final approval. Submission records actor/time independently of claims. Claim release/expiry does not undo handoff; rework requires explicit resubmission after capture/OCR.
-- `completed`: document workflow `approved`, never merely `awaiting_approval_l1`. The current schema has no final-approved state, so this view is empty; no approval decision or transition is added here.
+- `completed`: document workflow `approved`, never merely `awaiting_approval_l1`; explicit final confirmation now populates this view.
 
 Rows expose `workflow_status`, the current review's `qc_reviewer` and `qc_claim_live`. `sort=workflow_status` orders the stage column; an expired claim is not labelled as active QC. Filtered totals and independent per-view badge `counts` use the same predicates and authorized nondeleted scope in a read-only snapshot. `returned` remains an alias of `counts.rework`. Unfiltered status and the existing cancelled filter retain their API behavior. Ordinary operators see only current assignments; oversight remains permission-scoped. Resuming rework preserves its return date; resubmission removes current return indicators and returns it to tracking. Capture status, actor history, QC snapshots and mutation permissions are unchanged.
 
-No approval/archive API is implemented, and archive-role permission names do not grant access to the current operator/QC image routes.
+`server/approvals.mjs` supplies policy settings, the scoped `/api/records` registry/content/decisions, `/api/confirmations/:id` receipts/QR and operator notifications. [APPROVAL.md](APPROVAL.md) defines parameters and access. It does not grant approvers QC/OCR privileges; Viewer-only accounts use separate sanitized APIs. The single Documents menu shows published records only; L1/L2 task queues use the same worklist. First QC Pass fixes policy; return starts a new QC cycle, and whole-batch drop retains all history/files. Independent L2 takedown clears publication, returns to QC or L1 and requires fresh approvals; L1 return explicitly carries the original QC snapshot into a new cycle. Terminal snapshots and decisions are immutable.
 
 ## 8. Shared UI contract
 
-`WorklistTable` is used by QC, Capture Workspace/My Batches and administrator batch assignments. It accepts ordinary Ant Design Table props plus:
+`WorklistTable` is used by QC, Capture Workspace/My Batches, OCR jobs and administrator Users/Audit/batch assignments. It accepts ordinary Ant Design Table props plus:
 
 | Prop         | Meaning                                                                                         |
 | ------------ | ----------------------------------------------------------------------------------------------- |
@@ -186,7 +189,15 @@ No approval/archive API is implemented, and archive-role permission names do not
 
 `ColumnHeading`, `BatchIdentity` and `BatchIdHeading` share heading/copy behavior. `BatchIdentity` is icon-only across QC, operator, administrator batch tables and the OCR list: hover to view the code, click to copy. The shared component must not fetch data, grant permissions or invent approval actions. Callers own query state, columns, version checks and confirmations.
 
-Future role queues should reuse that table, `PageViewer`, `IconButton`, the compact theme and the existing shell. Read-only viewing must be a real permission mode, not an editable QC screen with buttons merely hidden. The OCR job list now uses `WorklistTable`; its narrow detail-page rail and other administrative tables retain their existing tables/height hook.
+Future role queues should reuse that table, `PageViewer`, `IconButton`, the compact theme and the existing shell. Read-only viewing must be a real permission mode, not an editable QC screen with buttons merely hidden. OCR's narrow detail-page rail retains its existing table/height hook.
+
+Users filters/sorts the complete existing account response before paging, including one tab per role. Create and reset accept an optional `password` (12–256 characters, without trimming); omission retains secure automatic generation. Passwords remain Argon2id hashes in storage, never audit metadata. The existing temporary-password response and mandatory first-sign-in change apply to both modes. Reset still revokes sessions; role separation and current/last administrator guards are unchanged. Bootstrap remains automatic-only.
+
+`POST /api/admin/users/bulk` accepts `action` (`delete` or `reset-password`) and 1–100 distinct `users: [{id,version}]`. Reset optionally accepts a shared `password`; omission generates a separate password for each account. Responses contain `affected` and one-time `credentials` (empty for deletion). Delete requires `users:delete` (granted to System Administrator by migration 015); reset requires `users:update`. Both retain normal authentication/CSRF checks. A single advisory-locked transaction and per-user row/version locks prevent partial changes; deleting the current or last active administrator is rejected. Single reset reuses the same locked reset helper and requires the current `version` too.
+
+User deletion is soft: `users.deleted_at` is set with `is_active=false`; sessions are revoked and `user.deleted` is audited. Lists exclude deleted users and update/reset reject them. Identity, roles, usernames, batches and audit references remain; administrators can reassign retained work through the existing batch assignment workflow. No restore, username reuse or physical deletion is introduced.
+
+`GET /api/admin/audit-logs` adds `category` (action namespace, e.g. `user`), `search` (up to 240 characters), and existing `limit`/`offset`. It returns `logs`, the filtered `total` and unfiltered category `counts`. Parameterized category/search predicates apply before paging, not to the loaded page. Existing `audit:read` authorization and append-only records are unchanged; the detail modal reads the returned complete record without a new mutation/API.
 
 ### URL-backed state currently implemented
 
@@ -195,6 +206,8 @@ Future role queues should reuse that table, `PageViewer`, `IconButton`, the comp
 | QC queue                   | `tab`, `status`, `q`, `metadata`, `ocr`, `sort`, `direction`, `page`, `size`                                                                                             |
 | Operator/admin batch lists | `status`, `q`, `sort`, `direction`, `page`, `size`, `activity`                                                                                                           |
 | OCR job list               | `status`, `q`, `sort`, `direction`, `page`, `size`; job details retain the originating list in `returnTo`                                                                |
+| Administrator Users        | `role`, `q`, `sort`, `direction`, `page`, `size`                                                                                                                         |
+| Administrator Audit        | `category`, `q`, `page`, `size`                                                                                                                                          |
 | Document inspection        | `tab`, `page`, `rail`, `session`, `excluded`, `original`, `revision`, `zoom`, `pixels`, `fullscreen`, `processing`, `machine`, `policy`, `evidence`, `field`, `returnTo` |
 
 In document URLs, `page` is a UUID and `rail` is the thumbnail-window number. In list URLs, `page` is a one-based page number. Boolean options use `1`/`0`; zoom uses `width`, `page` or a bounded numeric scale. Supported list sizes are 25/50/100. Invalid choices fall back to safe supported values.
@@ -207,6 +220,6 @@ This is **not** a claim that every OCR/admin/scanner control is URL-backed. Draf
 
 ## 9. Remaining development path
 
-Implement approval/viewer as a small extension to the same database and revision history, not another capture/OCR lifecycle. Before adding states, extend every current `awaiting_approval_l1` lock/guard and add rejection invalidation. The proposed sequence, unresolved business rules and acceptance checklist are in [APPROVAL.md](APPROVAL.md).
+Configurable approvals, Documents and authenticated QR receipts are implemented in source, with migration 016 extending L1 locks through L2/publication/drop and preserving fixed policy through returns. Migration 017 adds Viewer registration/approval, a separate published-only library and four append-only audit tables; `server/viewer.mjs` and `src/ViewerWorkspace.jsx` own this boundary. Viewer image-only PDFs use authenticated encoded POST transfer, with real decoded-byte progress and no direct GET attachment. Migration 018 adds L2 takedown to QC/L1 with immutable history and explicitly carried QC provenance. Acceptance coverage is written but unexecuted; runtime/rendered verification needs separate user authorization. See [APPROVAL.md](APPROVAL.md) and [VIEWER.md](VIEWER.md).
 
-No deployment hardening, new OCR engine, PDF pipeline, AI search, bulk export or multi-document splitting is implied by that plan. Agent test/browser/OCR/hardware runs still require the permissions documented in [AGENTS.md](AGENTS.md).
+No deployment hardening, new OCR engine, AI search, whole-library export or multi-document splitting is implied by that plan. Agent test/browser/OCR/hardware runs still require the permissions documented in [AGENTS.md](AGENTS.md).

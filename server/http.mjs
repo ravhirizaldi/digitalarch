@@ -1,7 +1,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { pipeline } from 'node:stream';
+import { pipeline, Transform } from 'node:stream';
 import { openSafe } from './storage.mjs';
 import { failure, publicError } from './errors.mjs';
 import { matchRoute } from '../src/routes.js';
@@ -30,6 +30,8 @@ async function readBody(req) {
 
 export function createHttpApp(service, publicDir = path.resolve('dist')) {
   return http.createServer(async (req, res) => {
+    let complete;
+    let bytesRead = 0;
     req.correlationId = randomUUID();
     const json = (status, body) => {
       res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -58,6 +60,7 @@ export function createHttpApp(service, publicDir = path.resolve('dist')) {
         return json(403, { error: 'Requests must come from this page.' });
       let handle;
       let mime;
+      let encoded = false;
       if (url.pathname.startsWith('/api/')) {
         if (!service?.application)
           throw failure('database_unavailable', 'Application persistence is not configured.', 503);
@@ -67,9 +70,34 @@ export function createHttpApp(service, publicDir = path.resolve('dist')) {
           url,
           mutation ? await readBody(req) : undefined,
         );
+        if (result?.onComplete) {
+          let called = false;
+          const started = Date.now();
+          complete = (success) => {
+            if (called) return;
+            called = true;
+            result
+              .onComplete(success, {
+                durationMs: Date.now() - started,
+                bytesRead,
+                serverReported: true,
+              })
+              .catch(() => console.error('Download outcome audit unavailable:', req.correlationId));
+          };
+          res.once('finish', () => complete(true));
+          res.once('close', () => complete(false));
+        }
+        if (result?.buffer) {
+          res.writeHead(200, {
+            'Content-Type': result.mime,
+            'Content-Length': result.buffer.length,
+          });
+          return res.end(req.method === 'HEAD' ? undefined : result.buffer);
+        }
         if (!result?.file) return json(200, result);
         handle = result.file;
         mime = result.mime;
+        encoded = !!result.encoded;
       } else {
         if (mutation) return json(404, { error: 'Not found.' });
         const relative = decodeURIComponent(
@@ -97,13 +125,30 @@ export function createHttpApp(service, publicDir = path.resolve('dist')) {
         mime = relative.endsWith('.css') ? 'text/css' : 'text/javascript';
       }
       const info = await handle.stat();
-      res.writeHead(200, { 'Content-Type': mime, 'Content-Length': info.size });
+      res.writeHead(200, {
+        'Content-Type': mime,
+        ...(encoded ? { 'X-Document-Bytes': info.size } : { 'Content-Length': info.size }),
+      });
       if (req.method === 'HEAD') {
         await handle.close();
         return res.end();
       }
-      pipeline(handle.createReadStream(), res, () => {});
+      const stream = handle.createReadStream({ highWaterMark: 64 * 1024 });
+      if (complete)
+        stream.on('data', (chunk) => {
+          bytesRead += chunk.length;
+        });
+      if (encoded) {
+        const packets = new Transform({
+          transform(chunk, _encoding, callback) {
+            callback(null, JSON.stringify({ data: chunk.toString('base64') }) + '\n');
+          },
+        });
+        pipeline(stream, packets, res, () => {});
+      } else pipeline(stream, res, () => {});
     } catch (error) {
+      complete?.(false);
+      if (res.headersSent) return res.destroy();
       if (error.code === 'ENOENT') return json(404, { error: 'Not found.' });
       if (error instanceof URIError) return json(400, { error: 'Invalid URL encoding.' });
       const problem = publicError(error);

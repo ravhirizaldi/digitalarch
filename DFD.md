@@ -1,6 +1,6 @@
 # Data flow diagrams
 
-**As-built baseline: 2026-11-15.** These Mermaid diagrams describe implemented capture/OCR/QC flows, including explicit operator submission in migration 014. They are source-derived documentation, not evidence that a new scan or inference was run. [APPROVAL.md](APPROVAL.md) contains the separate planned extension.
+**Source baseline: 2026-11-15.** These Mermaid diagrams describe capture/OCR/QC, approval and viewer flows through migration 017. They are source-derived documentation, not evidence of new runtime verification. [APPROVAL.md](APPROVAL.md) defines approval policy, scoped Documents and QR receipts; [VIEWER.md](VIEWER.md) defines registration, administrator authorization and published-image/PDF access.
 
 ## 1. System context
 
@@ -9,6 +9,8 @@ flowchart LR
     Operator["Operator"]
     QC["Independent QC Officer"]
     Admin["System Administrator"]
+    L1["L1 Supervisor"]
+    L2["Selected L2 Authority"]
     App["DigitalArch local workstation"]
     Scanner["Windows WIA scanner and driver"]
     Recognition["Local Tesseract or PaddleOCR runtime"]
@@ -20,6 +22,14 @@ flowchart LR
     App -->|authorized pages, metadata and OCR history| QC
     Admin -->|accounts, assignments, settings and claim release| App
     App -->|audit and operational status| Admin
+    L1 -->|confirm, nominate L2, return or drop| App
+    L2 -->|explicit publication confirmation, return or drop| App
+    App -->|locked reviewed revision and history| L1
+    App -->|assigned reviewed revision and history| L2
+    App -->|confirmation notification and printable QR| Operator
+    Viewer["Approved Viewer"] -->|search, tabs, page selection and PDF requests| App
+    App -->|published basic metadata, images and streamed PDF| Viewer
+    Admin -->|approve or reject viewer registration| App
     App -->|explicit user-initiated capture| Scanner
     Scanner -->|PNG output and device outcomes| App
     App -->|saved image and OCR configuration| Recognition
@@ -27,7 +37,7 @@ flowchart LR
     App -->|database, managed assets and recovery spools| Backup
 ```
 
-Administrator is oversight, not inherited capture/QC/approval authority. Approval and Archive Viewer roles are not drawn as live flows because their screens/APIs are not implemented. Backups are an operational responsibility, not a built-in automated backup service.
+Administrator is oversight, not inherited capture/QC/approval authority. L1-only policy skips L2 but still requires explicit L1 publication confirmation. Viewers see only final-published images/basic metadata and image-only PDFs, with four separate audit stores. Backups are an operational responsibility, not a built-in automated backup service.
 
 ## 2. Processes and stores
 
@@ -42,6 +52,7 @@ flowchart TB
     P4["4. Metadata extraction and verification"]
     P5["5. QC review and decision"]
     P6["6. Authorized preview and history reads"]
+    P7["7. Versioned approval and registry visibility"]
     Provider["Simulator or Windows capture provider"]
     Engine["Selected local OCR engine"]
     D1[("Accounts, roles and auth sessions")]
@@ -49,6 +60,7 @@ flowchart TB
     D3[("OCR defaults, jobs and page results")]
     D4[("Metadata revisions, QC reviews and corrections")]
     D5[("Append-only audit records")]
+    D6[("Approval policy, decisions and notification reads")]
     F1[("Retained provider spool")]
     F2[("Managed originals and replacement images")]
     F3[("Disposable previews and thumbnails")]
@@ -59,6 +71,7 @@ flowchart TB
     P1 --> P4
     P1 --> P5
     P1 --> P6
+    P1 --> P7
     P2 <--> D2
     P2 -->|persist session before feeding| Provider
     Provider --> F1
@@ -77,6 +90,13 @@ flowchart TB
     P5 <--> D4
     P5 -->|workflow state and version| D2
     P5 -->|integrity validation| F2
+    D6 -->|policy fixed at first QC Pass| P5
+    D4 -->|locked current QC revision| P7
+    P7 <--> D6
+    P7 <--> D2
+    P7 --> D5
+    P7 -->|authenticated QR receipt and operator notice| Browser
+    D6 -->|current publication decisions| P6
     P2 --> D5
     P3 --> D5
     P4 --> D5
@@ -96,6 +116,7 @@ flowchart TB
 - OCR reads the effective image snapshot, not an unversioned arbitrary upload. Temporary preparation never overwrites originals. Result commits are fenced by the job lease and retain engine/configuration identity.
 - Extraction combines available current OCR/corrections into candidates. Human metadata remains authoritative; historical per-run metadata is read-only.
 - QC reads and changes the same logical document. Return changes workflow/ownership of work, not file identity. Pass freezes a reviewed snapshot and rejects outstanding OCR.
+- Approval decisions refer to that exact QC revision. Return creates a new assigned QC cycle; drop closes the batch without deleting retained data. Registry reads enforce ownership/submission/final-publication scopes; QR lookup requires the same authenticated document access.
 - Audit events are intentionally bounded, but can contain user-entered reasons/notes and identifiers. Treat the audit store as private; do not export it publicly or use it to duplicate document text/secrets.
 - Preview derivatives are caches, not source records or backups. The browser never receives raw filesystem paths or database credentials.
 
@@ -143,14 +164,14 @@ The sequence abbreviates multi-page commits, polling, retries and return/resubmi
 
 ## 4. Trust and privacy boundaries
 
-| Boundary                         | Enforcement / limit                                                                                      |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Browser → API                    | Session cookie, same-origin checks, CSRF on mutations, body validation and server-side permission checks |
-| Role → document                  | Assigned operator or administrator; QC reads only submitted work, never access inferred from a URL       |
-| Capture spool → managed original | Decode, size/pixel limits, checksum, safe paths and exclusive finalization                               |
-| Worker → database                | Persistent job lease/token, expiry, image/config identity and versioned results                          |
-| QC → decision                    | Live independent claim, version checks, checklist/findings/metadata/OCR/file gates                       |
-| Database → image read            | Scoped endpoints; private files are not a publicly served scan directory                                 |
-| Workstation → backup             | Preserve database and managed/spool relationships together; no automated restore drill claimed           |
+| Boundary                         | Enforcement / limit                                                                                                                                         |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Browser → API                    | Session cookie, same-origin checks, CSRF on mutations, body validation and server-side permission checks                                                    |
+| Role → document                  | Operators' own work plus published records; QC/L1/L2 submitted plus published work; administrator oversight; no Archive Viewer grant or URL-based authority |
+| Capture spool → managed original | Decode, size/pixel limits, checksum, safe paths and exclusive finalization                                                                                  |
+| Worker → database                | Persistent job lease/token, expiry, image/config identity and versioned results                                                                             |
+| QC → decision                    | Live independent claim, version checks, checklist/findings/metadata/OCR/file gates                                                                          |
+| Database → image read            | Scoped endpoints; private files are not a publicly served scan directory                                                                                    |
+| Workstation → backup             | Preserve database and managed/spool relationships together; no automated restore drill claimed                                                              |
 
 Queue search terms can be present in navigation URLs/history. Private document content, OCR excerpts, account credentials and raw evidence must not be copied into public docs, fixtures or issue logs. Local HTTP/loopback and privileged administrator tamper risks remain; this is not a hardened remote deployment.

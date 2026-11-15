@@ -109,9 +109,15 @@ Migration `012_page_labels.sql` adds nullable `pages.page_label` (trimmed, 1–1
 
 Forward migration `013_page_number_scope.sql` includes batch identity in the view's window partition, keeping authorized batch filters pushable below numbering rather than computing numbers across the archive. It preserves the same numbering and was applied locally on the same date; already-applied migration 012 remains unchanged.
 
-### Approval extension boundary
+Migration `015_user_deletion.sql` adds `users.deleted_at` with a constraint requiring deleted accounts to be disabled, and grants `users:delete` to System Administrator. Account deletion is soft and audited; usernames remain reserved, sessions are revoked, and ownership/audit foreign keys remain intact. Deleted accounts cannot be re-enabled or password-reset through administration. Single/bulk deletion and bulk password resets use the existing administrator advisory lock, per-user row/version checks and one transaction; current/last-admin protection is retained. Password modes need no password-storage schema change: both manual and generated temporary passwords use the existing Argon2id hash and mandatory-change flag. Apply migration 015 before loading the updated backend.
 
-The current `documents.workflow_status` CHECK permits `capturing`, `operator_preparation`, legacy `preparing`, `qc_waiting`, `qc_in_review`, `rework` and `awaiting_approval_l1`. Approval-decision tables, L2/final states and archive-role read APIs do not exist yet. Current database page/OCR guards explicitly check `awaiting_approval_l1`; new states must extend those protections in a **new forward migration**, alongside matching application guards. Do not add a status value and accidentally make approved content editable. [APPROVAL.md](APPROVAL.md) describes the proposed model and unresolved rejection/access policies, separately from the actual ERD.
+### Approval and Documents
+
+Migration `016_approvals.sql` adds `awaiting_approval_l2`, `approved` and `dropped`, singleton versioned `approval_settings`, fixed document policy fields, nominated L2/publication identities, assigned QC return targets and reasons, append-only `approval_decisions` and per-user `approval_notification_reads`. Decisions uniquely identify a level and QC review; officer names are retained at decision time. Returned/dropped decisions require reasons; returns require a QC target. Legacy Awaiting L1 batches retain the previously expected L1→L2 policy. All earlier applied checksums are unchanged.
+
+First QC Pass fixes `approval_l2_required` and `approval_policy_version`; later settings edits or QC cycles cannot rewrite them. Page/enqueue/content guards cover L1, L2, published and dropped states. Terminal QC decisions/snapshots are immutable. API transactions enforce current-cycle/revision checks, historical actor independence, L1-before-L2 and selected-L2 confirmation. Return creates a fresh QC cycle without changing capture status. Drop closes every document in the batch without tombstoning the batch or deleting its children/files. Current application scope remains one logical document per batch.
+
+Working roles receive `documents:read`; System Administrator additionally receives `documents:read_all`. Archive Viewer has no staff record access; its existing `archive:read` permission gates separate basic-metadata/image/PDF routes. Publication requires the current passed QC revision and the decisions required by its fixed policy, not merely an old approval row. See [APPROVAL.md](APPROVAL.md) for read scopes and QR behavior. Apply migrations through 018 before loading the backend. Application behavior remains untested.
 
 ## Authentication and permission policy
 
@@ -119,20 +125,26 @@ Passwords: Argon2id, 65536KiB memory, three iterations, parallelism one, generat
 
 Session tokens: 32 random bytes in an HttpOnly, SameSite=Strict cookie; database contains SHA-256 only. A session-specific CSRF value is returned by login/me and kept in React memory; the database stores its hash. Login is protected by same-origin checks; other mutations also require the CSRF header. Expired, revoked or disabled-account sessions are rejected. Password changes rotate the current session and revoke all others. Account/role changes, disables and resets revoke every account session.
 
-| Role             | Granted permission groups                                                                                                    |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `operator`       | Assigned-batch create/read/update/resume/pause/complete/delete; scanner read/scan/configure; assigned OCR read/manage        |
-| `qc_officer`     | QC read/review/submit/return, all-batch/OCR read; no capture assignment or self-QC bypass                                    |
-| `approver_l1`    | L1 review/approve/reject, future only                                                                                        |
-| `approver_l2`    | L2 review/approve/reject, future only                                                                                        |
-| `archive_viewer` | Archive read/search, future only                                                                                             |
-| `system_admin`   | Users, roles, batch oversight/reassign, audit, settings, OCR oversight, QC read/reassign/configure; **no QC decision grant** |
+| Role             | Granted permission groups                                                                                                                                  |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operator`       | Assigned-batch create/read/update/resume/pause/complete/delete; scanner read/scan/configure; assigned OCR read/manage                                      |
+| `qc_officer`     | QC read/review/submit/return, all-batch/OCR read; no capture assignment or self-QC bypass                                                                  |
+| `approver_l1`    | Submitted Documents, L1 approval/return/drop, L2 nomination/reassignment                                                                                   |
+| `approver_l2`    | Submitted Documents; approval/return/drop for the L2 assignment; independent published-document takedown to QC/L1                                          |
+| `archive_viewer` | All final-published basic metadata/page images and audited image-only PDFs through separate viewer APIs                                                    |
+| `system_admin`   | Users, roles, viewer registration approval, batch oversight/reassign, audit, settings, OCR oversight, QC read/reassign/configure; **no QC decision grant** |
 
-Role assignment prevents combining L1/L2, or either approval role with Operator/QC. Administrator and explicit operational roles may coexist. QC denies the batch creator, assigned operator and every scan-session creator regardless of combined administrative roles. Administrator claim release requires a reason and does not grant review authority. Approval APIs remain out of scope.
+Role assignment prevents combining L1/L2, or either approval role with Operator/QC. Administrator and explicit operational roles may coexist. QC/approval independence retains prior capture/operator assignments and QC/approval participation across role changes. Administrator claim release/reassignment requires a reason and does not grant review authority.
 
 `pnpm admin:bootstrap` refuses if any administrator role assignment exists, even if disabled. Preserve existing installation accounts; never reset them as part of setup. A fresh installation has no built-in default login and must bootstrap interactively. Rotate demonstration credentials before deployment.
 
 ## Transaction and recovery boundaries
+
+### Viewer registration and auditing (migration 017, applied locally)
+
+`users.viewer_registration_status` is nullable for administrator-created accounts; public registrations are `pending`/inactive until administrator approval, or remain `rejected`/inactive. A CHECK prevents active pending/rejected accounts. Public registration assigns only Archive Viewer. Four tables (`viewer_registration_audit`, `viewer_access_audit`, `viewer_activity_audit`, `viewer_download_audit`) hold append-only category events with independent sequences, actor/subject/resource FKs and correlation IDs. Download events additionally share a `download_id`. `all_audit_logs` unions them with operational `audit_logs` for the existing administrator screen, without duplicated event storage. Private temporary exports live in `dataDir/viewer-exports`, never in the managed-original tree. See [VIEWER.md](VIEWER.md) for retention and observational limits.
+
+Migration 018, applied locally on 2026-11-15, adds immutable `publication_withdrawals` and optional `qc_reviews.carried_from_review_id`. Returning a publication directly to L1 reuses the original signed QC snapshot/actor/time explicitly, while allocating a new review cycle so old approval decisions cannot satisfy new publication. Returning to QC allocates an undecided review instead. Fixed per-batch approval policy and original snapshots/decisions remain unchanged.
 
 Batch creation plus placeholder document, user-role changes, state changes and session allocation are atomic. Batch mutations lock the row and compare its required version. Sessions have a partial unique index for `status='running'`. Global provider locking additionally prevents feeding the physical scanner twice across different batches.
 

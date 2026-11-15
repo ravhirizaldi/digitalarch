@@ -2,7 +2,7 @@
 
 Detailed installation and operating instructions for Windows + WSL2. For a short project overview, see [README.md](README.md).
 
-**Current boundary:** capture → OCR/metadata → independent QC → locked **Awaiting Approval Level 1**. Approval Levels 1/2 and the basic authenticated archive viewer are the remaining planned workflow, not implemented features. Their proposed scope and decisions to confirm are in [APPROVAL.md](APPROVAL.md).
+**Current source workflow:** capture → OCR/metadata → independent QC → L1 → selected L2, or explicit L1-only publication under the batch's fixed policy. Working roles use one **Documents** menu showing published records only. Viewers register at `/register`, wait for administrator approval and use `/library` with image-only PDF downloads and separate audits. Apply migrations through **017** before loading the updated backend (017 is applied locally). See [APPROVAL.md](APPROVAL.md) and [VIEWER.md](VIEWER.md); these changes remain runtime-unverified. Reload/sign in again to refresh administrator navigation permissions. Registration is viewport-contained with a compact two-column form, not a scrolling document.
 
 ## Documentation map
 
@@ -11,7 +11,8 @@ Detailed installation and operating instructions for Windows + WSL2. For a short
 | [DND.md](DND.md)                               | As-built design/development handoff, architecture, lifecycle, module/API map and reusable UI contracts  |
 | [ERD.md](ERD.md)                               | Mermaid entity relationships for security, capture, OCR, metadata and QC; actual versus JSON references |
 | [DFD.md](DFD.md)                               | Mermaid data flows, trust boundaries and capture-to-QC sequence                                         |
-| [APPROVAL.md](APPROVAL.md)                     | Proposed minimal L1/L2 approval and read-only viewer plan; not implemented                              |
+| [APPROVAL.md](APPROVAL.md)                     | Approval policy, decisions, Documents access and printable QR confirmations                             |
+| [VIEWER.md](VIEWER.md)                         | Viewer registration/approval, list/grid tabs, image-only PDFs, transfer progress and four audit tables  |
 | [PRODUCT.md](PRODUCT.md)                       | Product scope, operational constraints and remaining work                                               |
 | [DESIGN.md](DESIGN.md)                         | Compact workstation visual rules, shared components and navigation behavior                             |
 | [DATABASE.md](DATABASE.md)                     | Schema inventory, migrations, permissions, storage, backups and recovery                                |
@@ -62,7 +63,7 @@ pnpm admin:bootstrap
 pnpm dev
 ```
 
-Open **http://localhost:3000** in your Windows browser. Bootstrap prints a temporary administrator password once; sign in and change it. Create an **Operator** account in Users, or explicitly add the Operator role to your administrator account, to capture documents.
+Open **http://localhost:3000** in your Windows browser. Bootstrap prints a temporary administrator password once; sign in and change it. Create an **Operator** account in Users, or explicitly add the Operator role to your administrator account, to capture documents. User creation/reset offers a generated or manually set temporary password; both require a first-sign-in change. Select users for bulk reset (one shared manual password or separate generated passwords) or confirmed deletion. Deletion revokes access and hides accounts, but retains ownership/history and reserves their usernames; reassign their unfinished work if needed.
 
 Use **Capture Workspace → Scan New Batch**, choose Simulator or Real Hardware, capture pages, then **Complete Capture** to queue OCR. The Windows helpers build/install automatically on first use:
 
@@ -70,6 +71,8 @@ Use **Capture Workspace → Scan New Batch**, choose Simulator or Real Hardware,
 - **DigitalArch OCR** (`DigitalArch.Ocr/`): Tesseract command adapter.
 
 Helper installation lives under `%LOCALAPPDATA%\DigitalArch\DigitalArch.Service`; existing scan spools remain under `%LOCALAPPDATA%\DigitalArch\scans`.
+
+Create separate QC, L1 and L2 accounts for approval work. **Settings → Approval policy** controls whether future first QC passes require L2 and edits the two role display names. Each batch keeps its first-pass policy through rework. L1 selects L2; the selected officer must sign in and confirm. Operators receive confirmation notices with **View / print QR**; receipts remain in document history after dismissal. QR links use the local application origin: a phone scanning a localhost URL cannot verify against this workstation. No remote/public endpoint is added.
 
 ### 3. OCR settings
 
@@ -85,7 +88,7 @@ This downloads a project-local CPU runtime and PP-OCRv6 Small models (roughly 1.
 
 ## Document metadata and QC
 
-One batch is one logical document, even across multiple feeder sessions. Open **Prepare document** to enter optional metadata. **Complete Capture** queues OCR and opens preparation; it does not submit to QC. After OCR finishes, optionally edit metadata/pages or skip editing, then explicitly **Send to QC**. QC must claim before corrections. Returned work requires capture completion/OCR and a separate **Resubmit to QC**. Suggestions never overwrite human values. Apply migration 014 before starting the updated backend; L1/L2 decisions remain unimplemented.
+One batch is one logical document, even across multiple feeder sessions. Open **Prepare document** to enter optional metadata. **Complete Capture** queues OCR and opens preparation; it does not submit to QC. After OCR finishes, optionally edit metadata/pages or skip editing, then explicitly **Send to QC**. QC must claim before corrections. Returned work requires capture completion/OCR and a separate **Resubmit to QC**. Suggestions never overwrite human values. Apply all migrations through 016 before starting the updated backend; subsequent L1/L2 decisions and Documents are described in [APPROVAL.md](APPROVAL.md).
 
 An independent QC Officer opens **QC Queue**, claims a document, checks pages/order/completeness, verifies metadata and saves findings. Claims expire after 30 minutes without renewal. **Return to Operator** reopens the same batch for corrections, insertion or confirmed page replacement; **Resubmit to QC** creates a new review cycle. **Pass QC** locks the reviewed revision at **Awaiting Approval Level 1**, not final approval or publication. OCR-run metadata is read-only history; current values belong to the document.
 

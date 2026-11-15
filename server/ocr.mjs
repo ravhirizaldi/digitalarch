@@ -49,9 +49,15 @@ export function ocrProcessing(pool, storage, options = {}) {
         ]);
         const doc = await documentFor(client, source.batch_id, true);
         if (
-          ['preparing', 'qc_waiting', 'qc_in_review', 'awaiting_approval_l1'].includes(
-            doc?.workflow_status,
-          )
+          [
+            'preparing',
+            'qc_waiting',
+            'qc_in_review',
+            'awaiting_approval_l1',
+            'awaiting_approval_l2',
+            'approved',
+            'dropped',
+          ].includes(doc?.workflow_status)
         )
           throw failure(
             'document_locked',
@@ -522,9 +528,15 @@ export function ocrProcessing(pool, storage, options = {}) {
           throw failure('batch_locked', 'Complete capture before sending the batch to OCR.', 409);
         const doc = await documentFor(client, batchId, true);
         if (
-          ['preparing', 'qc_waiting', 'qc_in_review', 'awaiting_approval_l1'].includes(
-            doc?.workflow_status,
-          )
+          [
+            'preparing',
+            'qc_waiting',
+            'qc_in_review',
+            'awaiting_approval_l1',
+            'awaiting_approval_l2',
+            'approved',
+            'dropped',
+          ].includes(doc?.workflow_status)
         )
           throw failure(
             'document_locked',
