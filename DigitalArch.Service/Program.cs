@@ -63,6 +63,13 @@ try
     if (candidates.Count == 0) throw new CliFailure("device_not_found", "The configured scanner is not currently available through Windows WIA.");
     if (candidates.Count > 1) throw new CliFailure("ambiguous_device", "Multiple matching devices were found. Select an explicit device.");
     var scanner = candidates.Single();
+    if (inspect && args.Contains("--inventory-only"))
+    {
+        EmitInspection(new { success = true, state = "device_detected", canScan = true,
+            device = new { id = scanner.ID, scanner.Name, driver = "Wia" },
+            message = "Scanner discovered. Reserve it before loading paper; capabilities are checked exclusively at capture time." });
+        return;
+    }
     var settings = profile.Settings;
     var options = new ScanOptions
     {

@@ -638,7 +638,8 @@ export function batchOperations(
         throw failure('invalid_request', 'Invalid scanner options.');
       requirePermission(user, 'scanner:scan');
       const sessionId = randomUUID();
-      await scanner.start(
+      const selectedScanner = await scanner.forUser(user.id);
+      await selectedScanner.start(
         body.options || {},
         async (job) => {
           await transaction(pool, async (client) => {
@@ -692,7 +693,7 @@ export function batchOperations(
                 [id],
               )
             ).rows[0].n;
-            const selected = scanner.status();
+            const selected = selectedScanner.status();
             const profile = selected.profiles?.find((p) => p.id === selected.profileId);
             await client.query(
               `INSERT INTO scan_sessions(id,batch_id,document_id,session_number,status,created_by,scanner_mode,device_id,device_name,profile_id,profile_name,settings_snapshot,job_id,capture_order_base)
@@ -921,7 +922,7 @@ export function batchOperations(
               session.batch_id,
             );
         });
-        if (ended) scanner.releaseJob(session.job_id);
+        if (ended) await scanner.releaseJob(session.job_id);
       })();
       working.set(session.id, work);
       work.finally(() => working.delete(session.id)).catch(() => {});

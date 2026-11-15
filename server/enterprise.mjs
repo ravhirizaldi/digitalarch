@@ -448,12 +448,15 @@ export function enterprise({
         }
         if (pathname === '/api/scanner/status' && method === 'GET') {
           permit('scanner:read');
-          return { ...scanner.refreshIfNeeded(), capture: await batches.running(user) };
+          return {
+            ...(await scanner.forUser(user.id)).refreshIfNeeded(),
+            capture: await batches.running(user),
+          };
         }
         if (pathname === '/api/scanner/mode' && method === 'POST') {
           permit('scanner:configure');
           keys(body, ['mode']);
-          return await scanner.setMode(body.mode);
+          return await (await scanner.forUser(user.id)).setMode(body.mode);
         }
         if (pathname === '/api/scanner/refresh' && method === 'POST') {
           permit('scanner:configure');
@@ -464,8 +467,16 @@ export function enterprise({
             )
           )
             throw failure('invalid_request', 'Invalid scanner selection.');
-          await scanner.refresh(body);
-          return scanner.status();
+          return await (await scanner.forUser(user.id)).refresh(body);
+        }
+        if (
+          ['/api/scanner/reserve', '/api/scanner/release'].includes(pathname) &&
+          method === 'POST'
+        ) {
+          permit('scanner:scan');
+          keys(body, []);
+          const selected = await scanner.forUser(user.id);
+          return await (pathname.endsWith('/reserve') ? selected.reserve() : selected.release());
         }
         if (pathname === '/api/batches') {
           if (method === 'POST') {

@@ -2,6 +2,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHttpApp } from './server/http.mjs';
 import { scannerService } from './server/scanner/scanner-service.mjs';
+import { scannerFleet } from './server/scanner/scanner-fleet.mjs';
 import { simulatedScanner } from './server/scanner/simulated-scanner.mjs';
 import { realScanner } from './server/scanner/real-scanner.mjs';
 import { prepareScanner } from './bridge.mjs';
@@ -17,15 +18,31 @@ export async function createService({
   prepare = prepareScanner,
   customFixtures = process.env.DIGITALARCH_FIXTURES,
 } = {}) {
+  let preparation;
+  const prepareOnce = () =>
+    (preparation ||= Promise.resolve()
+      .then(prepare)
+      .catch((error) => {
+        preparation = null;
+        throw error;
+      }));
   const service = scannerService({
     dataDir,
     providers: {
       simulator: simulatedScanner({ scans: path.join(dataDir, 'capture-spool'), customFixtures }),
-      real: realScanner({ prepare }),
+      real: realScanner({ prepare: prepareOnce }),
     },
   });
   service.dataDir = dataDir;
   await service.initialize();
+  Object.assign(
+    service,
+    await scannerFleet({
+      base: service,
+      dataDir,
+      createReal: () => realScanner({ prepare: prepareOnce, inventoryOnly: true }),
+    }),
+  );
   return service;
 }
 

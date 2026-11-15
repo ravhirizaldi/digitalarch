@@ -47,7 +47,7 @@ export function matchDevice(profile, devices, selectedId) {
   };
 }
 
-export function realScanner({ prepare }) {
+export function realScanner({ prepare, inventoryOnly = false }) {
   let bridge;
   let profiles = [fallbackProfile];
   let devices = [];
@@ -84,7 +84,9 @@ export function realScanner({ prepare }) {
       try {
         bridge ||= await prepare();
         provider.scans = bridge.scans;
-        const inspection = bridge.inspect ? await bridge.inspect(profileId, deviceId) : null;
+        const inspection = bridge.inspect
+          ? await bridge.inspect(profileId, deviceId, inventoryOnly)
+          : null;
         const native = inspection || (await bridge.profiles());
         const result = inspection || (await bridge.devices());
         const oldProfiles = profiles;

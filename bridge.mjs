@@ -181,9 +181,10 @@ export async function prepareScanner() {
         (options.timeoutSeconds || 120) * 1000 + 15000,
         options.signal,
       ),
-    inspect: (profileId, deviceId) =>
+    inspect: (profileId, deviceId, inventoryOnly = false) =>
       invoke([
         '--inspect',
+        ...(inventoryOnly ? ['--inventory-only'] : []),
         ...(profileId ? ['--profile', profileId] : []),
         ...(deviceId ? ['--device', deviceId] : []),
         ...(process.env.DIGITALARCH_NAPS2_PROFILES
