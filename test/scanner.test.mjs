@@ -413,17 +413,17 @@ test('discovery prefers native defaults, reports setting/device changes, and nev
     { ...office, revision: 'two', settings: { ...office.settings, dpi: 600 } },
     profiles[1],
   ];
-  let status = await provider.inspect({}, true);
+  let status = await provider.inspect();
   assert.equal(status.profileId, 'office');
   assert.equal(status.profiles.find((profile) => profile.id === 'office').settings.dpi, 600);
   assert.match(status.inventoryChanges.join('\n'), /dpi: 300 → 600/);
   assert.deepEqual(status.profileFiles, ['profiles.xml']);
   devices = [];
-  status = await provider.inspect({}, true);
+  status = await provider.inspect();
   assert.equal(status.canScan, false);
   assert.match(status.inventoryChanges.join('\n'), /Device removed/);
   profiles = [profiles[1]];
-  status = await provider.inspect({}, true);
+  status = await provider.inspect();
   assert.equal(status.state, 'invalid_profile');
   assert.equal(status.profileId, 'office');
   assert.equal(status.canScan, false);
@@ -471,11 +471,10 @@ test('profile changes after selection abort scan preflight before bridge capture
   assert.equal(scans, 0);
 });
 
-test('automatic inventory refresh is throttled, serialized and never runs while capture is active', async (t) => {
+test('status polling never refreshes inventory; explicit refresh and scan preflight still inspect', async (t) => {
   let now = 40000;
   t.mock.method(Date, 'now', () => now);
   let inspected = 0;
-  let releaseInspection;
   let releaseCapture;
   const snapshot = {
     canScan: true,
@@ -489,12 +488,8 @@ test('automatic inventory refresh is throttled, serialized and never runs while 
     providers: {
       real: {
         snapshot: () => snapshot,
-        inspect: async (_selection, automatic) => {
+        inspect: async () => {
           inspected++;
-          if (automatic)
-            await new Promise((resolve) => {
-              releaseInspection = resolve;
-            });
           return snapshot;
         },
         scan: () =>
@@ -504,19 +499,17 @@ test('automatic inventory refresh is throttled, serialized and never runs while 
       },
     },
   });
-  assert.equal(service.refreshIfNeeded().checking, true);
-  service.refreshIfNeeded();
-  assert.equal(inspected, 1);
-  releaseInspection();
-  await until(() => !service.status().checking);
-  now += 29999;
-  service.refreshIfNeeded();
+  assert.equal(service.status().checking, false);
+  now += 40000;
+  service.status();
+  assert.equal(inspected, 0);
+  await service.refresh();
   assert.equal(inspected, 1);
   await service.start();
-  const afterPreflight = inspected;
+  assert.equal(inspected, 2);
   now += 40000;
-  service.refreshIfNeeded();
-  assert.equal(inspected, afterPreflight);
+  assert.equal(service.status().busy, true);
+  assert.equal(inspected, 2);
   releaseCapture();
 });
 

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
@@ -70,6 +71,37 @@ test('malformed recovery markers fail closed instead of making an unresolved dev
   await assert.rejects(createService({ dataDir }), { code: 'invalid_recovery_marker' });
 });
 
+test('status polling renews reservations without inspecting Windows', async (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  let inspections = 0;
+  const dataDir = await mkdtemp('/tmp/opencode/digitalarch-poll-');
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const service = await createService({
+    dataDir,
+    prepare: async () => ({
+      inspect: async () => {
+        inspections++;
+        return {
+          profiles: [],
+          devices: [{ id: 'a', name: 'Scanner', driver: 'Wia' }],
+          profileId: fallbackProfile.id,
+          probe: { success: true, state: 'device_detected', canScan: true },
+        };
+      },
+    }),
+  });
+  const operator = await service.forUser('operator');
+  await operator.setMode('real');
+  await operator.reserve();
+  now = 90000;
+  assert.equal(operator.pollStatus().reservation.held, true);
+  now = 180000;
+  assert.equal(operator.pollStatus().reservation.held, true);
+  assert.equal(operator.status().checking, false);
+  assert.equal(inspections, 1);
+});
+
 test('operator selections, capture cancellation and FIFO queues are independent across devices', async (t) => {
   const dataDir = await mkdtemp('/tmp/opencode/digitalarch-fleet-');
   t.after(() => rm(dataDir, { recursive: true, force: true }));
@@ -119,11 +151,11 @@ test('operator selections, capture cancellation and FIFO queues are independent 
   await three.reserve();
   assert.equal(two.status().reservation.position, 1);
   await assert.rejects(
-    two.start({}, async () => {}, 'two'),
+    two.start({}, async () => {}, randomUUID()),
     { code: 'reservation_required' },
   );
-  const a = await one.start({}, async () => {}, 'one');
-  const b = await three.start({}, async () => {}, 'three');
+  const a = await one.start({}, async () => {}, randomUUID());
+  const b = await three.start({}, async () => {}, randomUUID());
   await until(() => pending.size === 2);
   assert.equal(pending.get(a.id).deviceId, 'a');
   assert.equal(pending.get(b.id).deviceId, 'b');

@@ -76,8 +76,7 @@ export function realScanner({ prepare, inventoryOnly = false }) {
         inventoryChangedAt,
       };
     },
-    async inspect(selection = {}, automatic = false) {
-      const fault = automatic && status.state === 'scan_failed' ? status : null;
+    async inspect(selection = {}) {
       profileId = selection.profileId !== undefined ? selection.profileId : profileId;
       deviceId = selection.deviceId !== undefined ? selection.deviceId : deviceId;
       status = { ...status, state: 'checking', canScan: false, message: 'Checking Windows WIA…' };
@@ -233,7 +232,6 @@ export function realScanner({ prepare, inventoryOnly = false }) {
         if (status.state === 'helper_unavailable') bridge = null;
       }
       status.lastCheckedAt = new Date().toISOString();
-      if (fault) status = { ...status, state: fault.state, canScan: false, message: fault.message };
       return provider.snapshot();
     },
     validate(options) {

@@ -136,7 +136,7 @@ export default function ScannerSettings({
               type="info"
               showIcon
               title="Detection is not physical readiness"
-              description="Discovery refreshes about every 30 seconds when idle. Capability checks run only during reserved capture. Discovery does not prove paper or mechanical readiness. Use Refresh after clearing a jam."
+              description="Use Refresh to update devices and profiles. Capability checks run only during reserved capture. Discovery does not prove paper or mechanical readiness. Use Refresh after clearing a jam."
             />
             <Collapse
               size="small"

@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Checkbox,
+  Collapse,
   Drawer,
   Empty,
   Pagination,
@@ -383,57 +384,87 @@ export default function ScannerWorkspace({
           />
         </div>
       )}
-      {!locked && !simulator && (
-        <Alert
-          type={reservation?.recoveryRequired ? 'error' : reservation?.held ? 'success' : 'info'}
-          showIcon
-          title={
-            reservation?.recoveryRequired
-              ? 'Scanner locked for administrator recovery'
-              : reservation?.held
-                ? `Scanner reserved for you · ${reservation.waiting} waiting`
-                : reserved
-                  ? `Waiting for scanner · queue position ${reservation.position}`
-                  : 'Reserve a scanner before loading paper'
-          }
-          description={
-            reservation?.recoveryRequired
-              ? 'A previous capture did not release safely. An administrator must verify the Windows helper and device have stopped.'
-              : reservation?.held
-                ? 'Load your document, then choose Scan feeder. Release the scanner when finished.'
-                : reserved
-                  ? 'Your turn updates automatically. Scanning never starts automatically.'
-                  : 'Reservations and queue positions expire after two minutes without scanner-status updates.'
-          }
-          action={
-            <Button
-              onClick={() => onAction(reserved ? 'release' : 'reserve')}
-              disabled={busy || (!reserved && (!scanner.device || reservation?.recoveryRequired))}
-            >
-              {reserved
-                ? reservation.held
-                  ? 'Release scanner'
-                  : 'Leave queue'
-                : 'Reserve / join queue'}
-            </Button>
-          }
+      {((!locked && (!simulator || requestedMode)) || feedback) && (
+        <Collapse
+          size="small"
+          className="scanner-status"
+          items={[
+            {
+              key: 'status',
+              label:
+                feedback || reservation?.recoveryRequired
+                  ? 'Scanner status · Needs attention'
+                  : 'Scanner status',
+              children: (
+                <div className="feedback">
+                  {!locked && !simulator && (
+                    <Alert
+                      type={
+                        reservation?.recoveryRequired
+                          ? 'error'
+                          : reservation?.held
+                            ? 'success'
+                            : 'info'
+                      }
+                      showIcon
+                      title={
+                        reservation?.recoveryRequired
+                          ? 'Scanner locked for administrator recovery'
+                          : reservation?.held
+                            ? `Scanner reserved for you · ${reservation.waiting} waiting`
+                            : reserved
+                              ? `Waiting for scanner · queue position ${reservation.position}`
+                              : 'Reserve a scanner before loading paper'
+                      }
+                      description={
+                        reservation?.recoveryRequired
+                          ? 'A previous capture did not release safely. An administrator must verify the Windows helper and device have stopped.'
+                          : reservation?.held
+                            ? 'Load your document, then choose Scan feeder. Release the scanner when finished.'
+                            : reserved
+                              ? 'Your turn updates automatically. Scanning never starts automatically.'
+                              : 'Reservations and queue positions expire after two minutes without scanner-status updates.'
+                      }
+                      action={
+                        <Button
+                          onClick={() => onAction(reserved ? 'release' : 'reserve')}
+                          disabled={
+                            busy ||
+                            (!reserved && (!scanner.device || reservation?.recoveryRequired))
+                          }
+                        >
+                          {reserved
+                            ? reservation.held
+                              ? 'Release scanner'
+                              : 'Leave queue'
+                            : 'Reserve / join queue'}
+                        </Button>
+                      }
+                    />
+                  )}
+                  {((!locked && requestedMode) || feedback) && (
+                    <div className="feedback" role="status" aria-live="polite">
+                      {requestedMode ? (
+                        <Alert
+                          type="info"
+                          showIcon
+                          title={
+                            requestedMode === 'real'
+                              ? 'Checking real hardware… First setup may take longer; no scan is started.'
+                              : 'Switching to simulator…'
+                          }
+                        />
+                      ) : null}
+                      {!requestedMode && feedback && (
+                        <Alert type="error" showIcon title={feedback} />
+                      )}
+                    </div>
+                  )}
+                </div>
+              ),
+            },
+          ]}
         />
-      )}
-      {((!locked && requestedMode) || feedback) && (
-        <div className="feedback" role="status" aria-live="polite">
-          {requestedMode ? (
-            <Alert
-              type="info"
-              showIcon
-              title={
-                requestedMode === 'real'
-                  ? 'Checking real hardware… First setup may take longer; no scan is started.'
-                  : 'Switching to simulator…'
-              }
-            />
-          ) : null}
-          {!requestedMode && feedback && <Alert type="error" showIcon title={feedback} />}
-        </div>
       )}
       {!locked && membershipLocked && (
         <Alert

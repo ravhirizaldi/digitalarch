@@ -9,7 +9,6 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
   let checking = false;
   let current = null;
   let captureController = null;
-  let lastDiscoveryAt = 0;
   const jobs = new Map();
   const snapshots = {};
   const idle = () => {
@@ -44,19 +43,7 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
         canScan: !!snapshot.canScan && !checking && current?.status !== 'scanning',
       };
     },
-    refreshIfNeeded() {
-      if (
-        mode === 'real' &&
-        !checking &&
-        current?.status !== 'scanning' &&
-        Date.now() - lastDiscoveryAt >= 30000
-      )
-        api
-          .refresh({}, true)
-          .catch((error) => console.error('Automatic scanner discovery:', error.message));
-      return api.status();
-    },
-    async refresh(selection = {}, automatic = false) {
+    async refresh(selection = {}) {
       idle();
       if (mode === 'simulator' && Object.keys(selection).length)
         throw failure(
@@ -65,12 +52,11 @@ export function scannerService({ providers, dataDir, initialMode = 'simulator' }
         );
       checking = true;
       try {
-        snapshots[mode] = await providers[mode].inspect(selection, automatic);
+        snapshots[mode] = await providers[mode].inspect(selection);
         if (mode === 'real' && dataDir && providers.real.scans)
           await writeJson(dataDir, 'storage.json', { real: providers.real.scans });
         return snapshots[mode];
       } finally {
-        lastDiscoveryAt = Date.now();
         checking = false;
       }
     },

@@ -209,6 +209,11 @@ ul {
 .scenario-select {
   width: 220px;
 }
+.scanner-status {
+  flex-shrink: 0;
+  max-height: 40%;
+  overflow: auto;
+}
 .feedback {
   display: flex;
   flex-direction: column;

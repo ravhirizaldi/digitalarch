@@ -450,7 +450,7 @@ export function enterprise({
         if (pathname === '/api/scanner/status' && method === 'GET') {
           permit('scanner:read');
           return {
-            ...(await scanner.forUser(user.id)).refreshIfNeeded(),
+            ...(await scanner.forUser(user.id)).pollStatus(),
             capture: await batches.running(user),
           };
         }

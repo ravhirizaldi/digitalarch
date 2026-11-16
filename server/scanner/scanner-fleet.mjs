@@ -89,9 +89,8 @@ export async function scannerFleet({ base, createReal, dataDir }) {
           }
           const api = {
             status,
-            refreshIfNeeded() {
+            pollStatus() {
               reservations.heartbeat(owner);
-              local.refreshIfNeeded();
               return status();
             },
             refresh(selection = {}) {
