@@ -2,6 +2,7 @@ import { createServer } from 'vite';
 import { once } from 'node:events';
 import { createApp, createRuntimeService } from '../server.mjs';
 import { pathToFileURL } from 'node:url';
+import { localAccessError } from '../server/local-access.mjs';
 
 export async function startDevelopment({ service, port = 3000 } = {}) {
   const ownsService = !service;
@@ -23,12 +24,10 @@ export async function startDevelopment({ service, port = 3000 } = {}) {
           name: 'localhost-only',
           configureServer(server) {
             server.middlewares.use((req, res, next) => {
-              if (
-                !/^(localhost|127\.0\.0\.1):\d+$/.test(req.headers.host || '') ||
-                req.headers['sec-fetch-site'] === 'cross-site'
-              ) {
+              const accessError = localAccessError(req);
+              if (accessError) {
                 res.writeHead(403);
-                res.end('Local access only.');
+                res.end(accessError);
                 return;
               }
               next();

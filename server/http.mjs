@@ -5,6 +5,7 @@ import { pipeline, Transform } from 'node:stream';
 import { openSafe } from './storage.mjs';
 import { failure, publicError } from './errors.mjs';
 import { matchRoute } from '../src/routes.js';
+import { localAccessError } from './local-access.mjs';
 
 async function readBody(req) {
   const chunks = [];
@@ -46,11 +47,8 @@ export function createHttpApp(service, publicDir = path.resolve('dist')) {
       'Content-Security-Policy',
       "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     );
-    if (
-      !/^localhost(?::\d+)?$|^127\.0\.0\.1(?::\d+)?$/.test(req.headers.host || '') ||
-      req.headers['sec-fetch-site'] === 'cross-site'
-    )
-      return json(403, { error: 'Local access only.' });
+    const accessError = localAccessError(req);
+    if (accessError) return json(403, { error: accessError });
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (!['GET', 'HEAD', 'POST', 'PATCH'].includes(req.method))
